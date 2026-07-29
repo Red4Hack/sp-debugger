@@ -1,0 +1,642 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "1. Create Virtual Environment",
+            "type": "shell",
+            "command": "python",
+            "args": ["-m", "venv", ".venv"],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            }
+        },
+        {
+            "label": "2. Setup Environment",
+            "type": "shell",
+            "command": ".venv/bin/python",
+            "args": ["-m", "pip", "install", "--upgrade", "pip", "wheel", "setuptools"],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "windows": {
+                "command": ".venv\\Scripts\\python.exe"
+            }
+        },
+        {
+            "label": "3. Install ambuild",
+            "type": "shell",
+            "command": ".venv/bin/pip",
+            "args": ["install", "git+https://github.com/alliedmodders/ambuild"],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "windows": {
+                "command": ".venv\\Scripts\\pip.exe"
+            }
+        },
+        {
+            "label": "4. Clone SourceMod",
+            "type": "shell",
+            "command": "git",
+            "args": ["clone", "--recursive", "https://github.com/alliedmodders/sourcemod.git", "../sourcemod"],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            }
+        },
+        {
+            "label": "5. Setup SourcePawn Debug Branch",
+            "type": "shell",
+            "command": "bash",
+            "args": [
+                "-c",
+                "git remote show peace >/dev/null 2>&1 || git remote add peace https://github.com/peace-maker/sourcepawn.git; git fetch peace; git checkout -B debug_api_symbols peace/debug_api_symbols; git submodule update --init --recursive"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [],
+            "options": {
+                "cwd": "${workspaceFolder}/../sourcemod/sourcepawn"
+            },
+            "windows": {
+                "command": "cmd",
+                "args": [
+                    "/c",
+                    "git remote show peace >nul 2>&1 || git remote add peace https://github.com/peace-maker/sourcepawn.git && git fetch peace && git checkout -B debug_api_symbols peace/debug_api_symbols && git submodule update --init --recursive"
+                ]
+            }
+        },
+        {
+            "label": "6. Configure SourcePawn VM",
+            "type": "shell",
+            "command": "python",
+            "args": ["configure.py", "--enable-optimize", "--targets=x86,x86_64"],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [],
+            "options": {
+                "cwd": "${workspaceFolder}/../sourcemod/sourcepawn",
+                "env": {
+                    "PATH": "${workspaceFolder}/.venv/bin:${env:PATH}"
+                }
+            },
+            "windows": {
+                "options": {
+                    "cwd": "${workspaceFolder}/../sourcemod/sourcepawn",
+                    "env": {
+                        "PATH": "${workspaceFolder}\\.venv\\Scripts;${env:PATH}"
+                    }
+                }
+            }
+        },
+        {
+            "label": "7. Build SourcePawn VM",
+            "type": "shell",
+            "command": "ambuild",
+            "args": ["objdir"],
+            "options": {
+                "cwd": "${workspaceFolder}/../sourcemod/sourcepawn",
+                "env": {
+                    "PATH": "${workspaceFolder}/.venv/bin:${env:PATH}"
+                }
+            },
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [
+                {
+                    "owner": "cpp",
+                    "fileLocation": ["relative", "${workspaceFolder}/../sourcemod/sourcepawn"],
+                    "pattern": {
+                        "regexp": "^(.*):(\\d+):(\\d+):\\s+(warning|error):\\s+(.*)$",
+                        "file": 1,
+                        "line": 2,
+                        "column": 3,
+                        "severity": 4,
+                        "message": 5
+                    }
+                }
+            ],
+            "windows": {
+                "options": {
+                    "cwd": "${workspaceFolder}/../sourcemod/sourcepawn",
+                    "env": {
+                        "PATH": "${workspaceFolder}\\.venv\\Scripts;${env:PATH}"
+                    }
+                }
+            }
+        },
+        {
+            "label": "Fetch Debugger Source (upstream + patch)",
+            "detail": "Reconstructs sp-console-debugger/ (not committed) from the pinned upstream commit + patches/sp-console-debugger.patch. No-op if already present.",
+            "type": "shell",
+            "command": "bash",
+            "args": [
+                "-c",
+                "test -f sp-console-debugger/frame-utils.h && echo 'sp-console-debugger/ already present; skipping fetch' || (sha=$(cat patches/sp-console-debugger.commit) && test -n \"$sha\" && git init sp-console-debugger && git -C sp-console-debugger fetch --depth 1 https://github.com/peace-maker/sp-console-debugger \"$sha\" && git -C sp-console-debugger reset --hard FETCH_HEAD && git -C sp-console-debugger apply --whitespace=nowarn ../patches/sp-console-debugger.patch && echo 'sp-console-debugger/ reconstructed')"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "windows": {
+                "command": "powershell",
+                "args": [
+                    "-Command",
+                    "if (Test-Path sp-console-debugger/frame-utils.h) { Write-Host 'sp-console-debugger/ already present; skipping fetch' } else { $sha = (Get-Content patches/sp-console-debugger.commit -First 1); if (-not $sha) { throw 'patches/sp-console-debugger.commit missing or empty' }; git init sp-console-debugger; git -C sp-console-debugger fetch --depth 1 https://github.com/peace-maker/sp-console-debugger $sha; git -C sp-console-debugger reset --hard FETCH_HEAD; git -C sp-console-debugger apply --whitespace=nowarn ../patches/sp-console-debugger.patch }"
+                ]
+            }
+        },
+        {
+            "label": "8. Configure Extension (Full x86+x86_64)",
+            "type": "shell",
+            "command": "python",
+            "args": ["configure.py", "--enable-optimize", "--targets=x86,x86_64", "--sm-path=${workspaceFolder}/../sourcemod"],
+            "dependsOn": ["Fetch Debugger Source (upstream + patch)"],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [
+                {
+                    "owner": "cpp",
+                    "fileLocation": ["relative", "${workspaceFolder}"],
+                    "pattern": {
+                        "regexp": "^(.*):(\\d+):(\\d+):\\s+(warning|error):\\s+(.*)$",
+                        "file": 1,
+                        "line": 2,
+                        "column": 3,
+                        "severity": 4,
+                        "message": 5
+                    }
+                }
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "${workspaceFolder}/.venv/bin:${env:PATH}"
+                }
+            },
+            "windows": {
+                "args": ["configure.py", "--enable-optimize", "--targets=x86,x86_64", "--sm-path=${workspaceFolder}\\..\\sourcemod"],
+                "options": {
+                    "cwd": "${workspaceFolder}",
+                    "env": {
+                        "PATH": "${workspaceFolder}\\.venv\\Scripts;${env:PATH}"
+                    }
+                }
+            }
+        },
+        {
+            "label": "8. Configure Extension (x86_64 only)",
+            "type": "shell",
+            "command": "python",
+            "args": ["configure.py", "--enable-optimize", "--targets=x86_64", "--sm-path=${workspaceFolder}/../sourcemod"],
+            "dependsOn": ["Fetch Debugger Source (upstream + patch)"],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [
+                {
+                    "owner": "cpp",
+                    "fileLocation": ["relative", "${workspaceFolder}"],
+                    "pattern": {
+                        "regexp": "^(.*):(\\d+):(\\d+):\\s+(warning|error):\\s+(.*)$",
+                        "file": 1,
+                        "line": 2,
+                        "column": 3,
+                        "severity": 4,
+                        "message": 5
+                    }
+                }
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "${workspaceFolder}/.venv/bin:${env:PATH}"
+                }
+            },
+            "windows": {
+                "args": ["configure.py", "--enable-optimize", "--targets=x86_64", "--sm-path=${workspaceFolder}\\..\\sourcemod"],
+                "options": {
+                    "cwd": "${workspaceFolder}",
+                    "env": {
+                        "PATH": "${workspaceFolder}\\.venv\\Scripts;${env:PATH}"
+                    }
+                }
+            }
+        },
+        {
+            "label": "9. Build Extension",
+            "type": "shell",
+            "command": "ambuild",
+            "args": ["objdir"],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "${workspaceFolder}/.venv/bin:${env:PATH}"
+                }
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [
+                {
+                    "owner": "cpp",
+                    "fileLocation": ["relative", "${workspaceFolder}"],
+                    "pattern": {
+                        "regexp": "^(.*):(\\d+):(\\d+):\\s+(warning|error):\\s+(.*)$",
+                        "file": 1,
+                        "line": 2,
+                        "column": 3,
+                        "severity": 4,
+                        "message": 5
+                    }
+                }
+            ],
+            "windows": {
+                "options": {
+                    "cwd": "${workspaceFolder}",
+                    "env": {
+                        "PATH": "${workspaceFolder}\\.venv\\Scripts;${env:PATH}"
+                    }
+                }
+            }
+        },
+        {
+            "label": "10. Copy SourcePawn VM Files (Linux)",
+            "type": "shell",
+            "command": "bash",
+            "args": [
+                "-c",
+                "mkdir -p '${workspaceFolder}/objdir/package/addons/sourcemod/bin' && mkdir -p '${workspaceFolder}/objdir/package/addons/sourcemod/bin/x64' && if [ -f '${workspaceFolder}/../sourcemod/sourcepawn/objdir/libsourcepawn/linux-x86/libsourcepawn.so' ]; then cp '${workspaceFolder}/../sourcemod/sourcepawn/objdir/libsourcepawn/linux-x86/libsourcepawn.so' '${workspaceFolder}/objdir/package/addons/sourcemod/bin/sourcepawn.jit.x86.so' && echo 'Copied x86 VM'; fi && if [ -f '${workspaceFolder}/../sourcemod/sourcepawn/objdir/libsourcepawn/linux-x86_64/libsourcepawn.so' ]; then cp '${workspaceFolder}/../sourcemod/sourcepawn/objdir/libsourcepawn/linux-x86_64/libsourcepawn.so' '${workspaceFolder}/objdir/package/addons/sourcemod/bin/x64/sourcepawn.vm.so' && echo 'Copied x86_64 VM'; fi && echo 'SourcePawn VM files copied (Linux)'"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "10. Copy SourcePawn VM Files (Windows)",
+            "type": "shell",
+            "command": "cmd",
+            "args": [
+                "/c",
+                "if not exist \"${workspaceFolder}\\objdir\\package\\addons\\sourcemod\\bin\" mkdir \"${workspaceFolder}\\objdir\\package\\addons\\sourcemod\\bin\" && if not exist \"${workspaceFolder}\\objdir\\package\\addons\\sourcemod\\bin\\x64\" mkdir \"${workspaceFolder}\\objdir\\package\\addons\\sourcemod\\bin\\x64\" && if exist \"${workspaceFolder}\\..\\sourcemod\\sourcepawn\\objdir\\libsourcepawn\\windows-x86\\libsourcepawn.dll\" (copy /Y \"${workspaceFolder}\\..\\sourcemod\\sourcepawn\\objdir\\libsourcepawn\\windows-x86\\libsourcepawn.dll\" \"${workspaceFolder}\\objdir\\package\\addons\\sourcemod\\bin\\sourcepawn.jit.x86.dll\" && echo Copied x86 VM) && if exist \"${workspaceFolder}\\..\\sourcemod\\sourcepawn\\objdir\\libsourcepawn\\windows-x86_64\\libsourcepawn.dll\" (copy /Y \"${workspaceFolder}\\..\\sourcemod\\sourcepawn\\objdir\\libsourcepawn\\windows-x86_64\\libsourcepawn.dll\" \"${workspaceFolder}\\objdir\\package\\addons\\sourcemod\\bin\\x64\\sourcepawn.vm.dll\" && echo Copied x86_64 VM) && echo SourcePawn VM files copied (Windows)"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Check Environment Status",
+            "type": "shell",
+            "command": "bash",
+            "args": [
+                "-c",
+                "echo '=== Environment Status ==='; echo -n 'Virtual Environment: '; if [ -d '.venv' ]; then echo 'EXISTS'; else echo 'MISSING'; fi; echo -n 'SourceMod Repository: '; if [ -d '../sourcemod' ]; then echo 'EXISTS'; else echo 'MISSING'; fi; echo -n 'SourcePawn VM x86 Built: '; if [ -f '../sourcemod/sourcepawn/objdir/libsourcepawn/linux-x86/libsourcepawn.so' ]; then echo 'EXISTS (Linux)'; elif [ -f '../sourcemod/sourcepawn/objdir/libsourcepawn/windows-x86/libsourcepawn.dll' ]; then echo 'EXISTS (Windows)'; else echo 'MISSING'; fi; echo -n 'SourcePawn VM x86_64 Built: '; if [ -f '../sourcemod/sourcepawn/objdir/libsourcepawn/linux-x86_64/libsourcepawn.so' ]; then echo 'EXISTS (Linux)'; elif [ -f '../sourcemod/sourcepawn/objdir/libsourcepawn/windows-x86_64/libsourcepawn.dll' ]; then echo 'EXISTS (Windows)'; else echo 'MISSING'; fi; echo -n 'Extension Configured: '; if [ -d 'objdir' ]; then echo 'EXISTS'; else echo 'MISSING'; fi; echo -n 'Extension x86 Built: '; if [ -f 'objdir/package/addons/sourcemod/extensions/linux-x86/sp-debugger.ext.so' ]; then echo 'EXISTS (Linux)'; elif [ -f 'objdir/package/addons/sourcemod/extensions/windows-x86/sp-debugger.ext.dll' ]; then echo 'EXISTS (Windows)'; else echo 'MISSING'; fi; echo -n 'Extension x86_64 Built: '; if [ -f 'objdir/package/addons/sourcemod/extensions/linux-x86_64/sp-debugger.ext.so' ]; then echo 'EXISTS (Linux)'; elif [ -f 'objdir/package/addons/sourcemod/extensions/windows-x86_64/sp-debugger.ext.dll' ]; then echo 'EXISTS (Windows)'; else echo 'MISSING'; fi"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [],
+            "windows": {
+                "command": "cmd",
+                "args": [
+                    "/c",
+                    "echo === Environment Status === & echo|set /p=\"Virtual Environment: \" & if exist \".venv\" (echo EXISTS) else (echo MISSING) & echo|set /p=\"SourceMod Repository: \" & if exist \"..\\sourcemod\" (echo EXISTS) else (echo MISSING) & echo|set /p=\"SourcePawn VM x86 Built: \" & if exist \"..\\sourcemod\\sourcepawn\\objdir\\libsourcepawn\\windows-x86\\libsourcepawn.dll\" (echo EXISTS) else (echo MISSING) & echo|set /p=\"SourcePawn VM x86_64 Built: \" & if exist \"..\\sourcemod\\sourcepawn\\objdir\\libsourcepawn\\windows-x86_64\\libsourcepawn.dll\" (echo EXISTS) else (echo MISSING) & echo|set /p=\"Extension Configured: \" & if exist \"objdir\" (echo EXISTS) else (echo MISSING) & echo|set /p=\"Extension x86 Built: \" & if exist \"objdir\\package\\addons\\sourcemod\\extensions\\windows-x86\\sp-debugger.ext.dll\" (echo EXISTS) else (echo MISSING) & echo|set /p=\"Extension x86_64 Built: \" & if exist \"objdir\\package\\addons\\sourcemod\\extensions\\windows-x86_64\\sp-debugger.ext.dll\" (echo EXISTS) else (echo MISSING)"
+                ]
+            }
+        },
+        {
+            "label": "Clean Build Artifacts",
+            "type": "shell",
+            "command": "bash",
+            "args": [
+                "-c",
+                "echo 'Cleaning build artifacts...'; [ -d 'objdir' ] && rm -rf objdir && echo 'Extension objdir cleaned'; [ -d '../sourcemod/sourcepawn/objdir' ] && rm -rf ../sourcemod/sourcepawn/objdir && echo 'SourcePawn objdir cleaned'; echo 'Build artifacts cleaned. Virtual environment and repositories preserved.'"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [],
+            "windows": {
+                "command": "cmd",
+                "args": [
+                    "/c",
+                    "echo Cleaning build artifacts... & if exist \"objdir\" (rmdir /s /q \"objdir\" && echo Extension objdir cleaned) & if exist \"..\\sourcemod\\sourcepawn\\objdir\" (rmdir /s /q \"..\\sourcemod\\sourcepawn\\objdir\" && echo SourcePawn objdir cleaned) & echo Build artifacts cleaned. Virtual environment and repositories preserved."
+                ]
+            }
+        },
+        {
+            "label": "Clean Everything",
+            "type": "shell",
+            "command": "bash", 
+            "args": [
+                "-c",
+                "echo 'Cleaning everything...'; [ -d '.venv' ] && rm -rf .venv && echo 'Virtual environment removed'; [ -d 'objdir' ] && rm -rf objdir && echo 'Extension objdir removed'; [ -d '../sourcemod' ] && rm -rf ../sourcemod && echo 'SourceMod repository removed'; echo 'Everything cleaned. Ready for fresh build.'"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [],
+            "windows": {
+                "command": "cmd",
+                "args": [
+                    "/c",
+                    "echo Cleaning everything... & if exist \".venv\" (rmdir /s /q \".venv\" && echo Virtual environment removed) & if exist \"objdir\" (rmdir /s /q \"objdir\" && echo Extension objdir removed) & if exist \"..\\sourcemod\" (rmdir /s /q \"..\\sourcemod\" && echo SourceMod repository removed) & echo Everything cleaned. Ready for fresh build."
+                ]
+            }
+        },
+        {
+            "label": "Full Build Sequence (Linux) - Both Architectures",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "1. Create Virtual Environment",
+                "2. Setup Environment", 
+                "3. Install ambuild",
+                "4. Clone SourceMod",
+                "5. Setup SourcePawn Debug Branch",
+                "6. Configure SourcePawn VM",
+                "7. Build SourcePawn VM",
+                "8. Configure Extension (Full x86+x86_64)",
+                "9. Build Extension",
+                "10. Copy SourcePawn VM Files (Linux)"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            }
+        },
+        {
+            "label": "Full Build Sequence (Windows) - Both Architectures",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "1. Create Virtual Environment",
+                "2. Setup Environment",
+                "3. Install ambuild", 
+                "4. Clone SourceMod",
+                "5. Setup SourcePawn Debug Branch",
+                "6. Configure SourcePawn VM",
+                "7. Build SourcePawn VM",
+                "8. Configure Extension (Full x86+x86_64)",
+                "9. Build Extension",
+                "10. Copy SourcePawn VM Files (Windows)"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            }
+        },
+        {
+            "label": "Quick Rebuild (Both Architectures)",
+            "dependsOrder": "sequence", 
+            "dependsOn": [
+                "6. Configure SourcePawn VM",
+                "7. Build SourcePawn VM",
+                "8. Configure Extension (Full x86+x86_64)",
+                "9. Build Extension"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            }
+        },
+        {
+            "label": "Build x86_64 Only",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "1. Create Virtual Environment",
+                "2. Setup Environment",
+                "3. Install ambuild",
+                "4. Clone SourceMod",
+                "5. Setup SourcePawn Debug Branch",
+                "6. Configure SourcePawn VM",
+                "7. Build SourcePawn VM",
+                "8. Configure Extension (x86_64 only)",
+                "9. Build Extension"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            }
+        },
+        {
+            "label": "watch:extension",
+            "type": "shell",
+            "command": "bun",
+            "args": [
+                "run",
+                "watch:start"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/vscode",
+                "env": {
+                    "NODE_ENV": "development",
+                    "PATH": "${env:HOME}/.bun/bin:${env:PATH}"
+                }
+            },
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "watch:extension (debug mode)",
+            "type": "shell",
+            "command": "bun",
+            "args": [
+                "run",
+                "watch:start"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/vscode",
+                "env": {
+                    "NODE_ENV": "development",
+                    "VSCODE_DEBUG": "true",
+                    "PATH": "${env:HOME}/.bun/bin:${env:PATH}"
+                }
+            },
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "compile:extension",
+            "type": "shell",
+            "command": "bun",
+            "args": [
+                "run",
+                "compile"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/vscode",
+                "env": {
+                    "PATH": "${env:HOME}/.bun/bin:${env:PATH}"
+                }
+            },
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": []
+        }
+    ]
+}

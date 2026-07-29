@@ -1,0 +1,9 @@
+# Bun test-runner configuration.
+[test]
+# Only discover tests under src/ -- the compiled out/ tree and the headless
+# DAP tools (scripts/, tests/) must not be picked up by `bun test`.
+root = "src"
+# Runs before any test file: registers the mock "vscode" module (the real one
+# only exists inside VS Code's extension host) and forces the Logger into
+# development mode. See src/__tests__/setup.ts.
+preload = ["./src/__tests__/setup.ts"]

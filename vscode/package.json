@@ -1,0 +1,368 @@
+{
+  "name": "sp-debugger",
+  "displayName": "SourcePawn Debugger",
+  "description": "Remote debugging for SourcePawn plugins directly in VSCode",
+  "version": "1.0.3",
+  "publisher": "ViniciusRed",
+  "license": "GPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ViniciusRed/sp-debugger.git"
+  },
+  "engines": {
+    "vscode": "^1.105.0"
+  },
+  "categories": [
+    "Debuggers",
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onDebugResolve:sp-debugger",
+    "onView:spDebuggerProfiler",
+    "onCommand:sp-debugger.takeProfile",
+    "onCommand:sp-debugger.openFlameChart"
+  ],
+  "main": "./out/extension.js",
+  "scripts": {
+    "build": "bunx vsce package",
+    "compile": "bun tsc -p ./",
+    "watch": "bun tsc -watch -p ./",
+    "watch:start": "bunx tsc-watch --onSuccess \"bun run compile\"",
+    "vscode:prepublish": "bun run compile",
+    "test-compile": "bun tsc -p ./",
+    "test-watch": "bun tsc -watch -p ./",
+    "test": "bun test",
+    "test:integration": "./tests/dap/run_dap_tests.sh",
+    "test:watch": "bun test --watch",
+    "test:coverage": "bun test --coverage",
+    "test:debug": "bun --inspect-brk test",
+    "format": "prettier --write \"**/*.{ts,js,json,md}\""
+  },
+  "devDependencies": {
+    "@types/chai": "5.2.3",
+    "@types/jest": "30.0.0",
+    "@types/node": "24.9.1",
+    "@types/vscode": "1.105.0",
+    "@typescript-eslint/eslint-plugin": "8.46.2",
+    "@typescript-eslint/parser": "8.46.2",
+    "@vscode/debugadapter-testsupport": "1.68.0",
+    "@vscode/debugprotocol": "1.68.0",
+    "@vscode/vsce": "3.6.2",
+    "chai": "6.2.0",
+    "eslint": "9.38.0",
+    "jest": "30.2.0",
+    "jest-environment-node": "30.2.0",
+    "prettier": "3.6.2",
+    "prettier-plugin-one-line-imports": "1.0.1",
+    "ts-jest": "29.4.5",
+    "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "@vscode/debugadapter": "1.68.0"
+  },
+  "prettier": {
+    "plugins": [
+      "./node_modules/prettier-plugin-one-line-imports/dist/index.mjs"
+    ]
+  },
+  "contributes": {
+    "breakpoints": [
+      {
+        "language": "sourcepawn"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "sp-debugger",
+        "label": "SourcePawn Debugger",
+        "program": "./out/extension.js",
+        "runtime": "bun",
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "host",
+              "port",
+              "plugin"
+            ],
+            "properties": {
+              "host": {
+                "type": "string",
+                "description": "Host address of the SourceMod server",
+                "default": "localhost"
+              },
+              "port": {
+                "type": "number",
+                "description": "Port of the SourceMod debug server",
+                "default": 8080
+              },
+              "token": {
+                "type": "string",
+                "description": "Shared secret matching \"token\" in the server's addons/sourcemod/configs/console-debugger.cfg. Required when the server's debug listener is bound to a non-loopback address; ignored when it listens on 127.0.0.1.",
+                "default": ""
+              },
+              "plugin": {
+                "type": "string",
+                "description": "Path to the .sp file to debug",
+                "default": "${file}"
+              },
+              "timeout": {
+                "type": "object",
+                "description": "Timeout configuration for debug session",
+                "properties": {
+                  "connection": {
+                    "type": "number",
+                    "description": "Connection timeout in milliseconds",
+                    "default": 10000
+                  },
+                  "request": {
+                    "type": "number",
+                    "description": "General request timeout in milliseconds",
+                    "default": 30000
+                  },
+                  "stepping": {
+                    "type": "number",
+                    "description": "Stepping commands timeout in milliseconds (continue, next, stepIn, stepOut, pause)",
+                    "default": 60000
+                  },
+                  "keepalive": {
+                    "type": "number",
+                    "description": "Keepalive interval in milliseconds",
+                    "default": 15000
+                  }
+                }
+              },
+              "reconnect": {
+                "type": "object",
+                "description": "Automatic reconnection configuration",
+                "properties": {
+                  "enabled": {
+                    "type": "boolean",
+                    "description": "Enable automatic reconnection on connection loss",
+                    "default": true
+                  },
+                  "maxAttempts": {
+                    "type": "number",
+                    "description": "Maximum reconnection attempts",
+                    "default": 5
+                  },
+                  "baseDelay": {
+                    "type": "number",
+                    "description": "Base delay between reconnection attempts in milliseconds",
+                    "default": 1000
+                  },
+                  "maxDelay": {
+                    "type": "number",
+                    "description": "Maximum delay between reconnection attempts in milliseconds",
+                    "default": 30000
+                  }
+                }
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Pause at the first executed line after launch. Off by default so breakpoints drive the stops (pausing at a function's declaration line shows no local variables yet).",
+                "default": false
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "sp-debugger",
+            "request": "launch",
+            "name": "Debug SourcePawn Plugin",
+            "host": "localhost",
+            "port": 8080,
+            "plugin": "${file}"
+          }
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "sp-debugger.debugActiveFile",
+        "title": "Debug Active SourcePawn File"
+      },
+      {
+        "command": "sp-debugger.takeProfile",
+        "title": "Take Performance Profile",
+        "category": "SourcePawn",
+        "icon": "$(record)"
+      },
+      {
+        "command": "sp-debugger.openFlameChart",
+        "title": "Open Flame Chart of Last Profile",
+        "category": "SourcePawn",
+        "icon": "$(flame)"
+      },
+      {
+        "command": "sp-debugger.clearProfiler",
+        "title": "Clear Profiler Tree",
+        "category": "SourcePawn",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "sp-debugger.profilerToggleMode",
+        "title": "Toggle Call Tree / Top Functions",
+        "category": "SourcePawn",
+        "icon": "$(list-tree)"
+      },
+      {
+        "command": "sp-debugger.profilerToggleSort",
+        "title": "Toggle Sort: Self / Total Time",
+        "category": "SourcePawn",
+        "icon": "$(sort-precedence)"
+      },
+      {
+        "command": "sp-debugger.profilerModeShowFlat",
+        "title": "Profiler: Call Tree (click to show Top Functions)",
+        "category": "SourcePawn",
+        "icon": "$(list-tree)"
+      },
+      {
+        "command": "sp-debugger.profilerModeShowTree",
+        "title": "Profiler: Top Functions (click to show Call Tree)",
+        "category": "SourcePawn",
+        "icon": "$(list-flat)"
+      },
+      {
+        "command": "sp-debugger.profilerSortShowTotal",
+        "title": "Profiler: Sorting by Self time (click to sort by Total)",
+        "category": "SourcePawn",
+        "icon": "$(sort-precedence)"
+      },
+      {
+        "command": "sp-debugger.profilerSortShowSelf",
+        "title": "Profiler: Sorting by Total time (click to sort by Self)",
+        "category": "SourcePawn",
+        "icon": "$(list-ordered)"
+      },
+      {
+        "command": "sp-debugger.revealProfileFunction",
+        "title": "Open Function Source",
+        "category": "SourcePawn"
+      },
+      {
+        "command": "sp-debugger.exportProfileTrace",
+        "title": "Export Profile as Trace (Perfetto)",
+        "category": "SourcePawn",
+        "icon": "$(graph-line)"
+      }
+    ],
+    "views": {
+      "debug": [
+        {
+          "id": "spDebuggerProfiler",
+          "name": "SourcePawn Profiler",
+          "contextualTitle": "SourcePawn Profiler",
+          "when": "debugType == sp-debugger"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "spDebuggerProfiler",
+        "contents": "Profile function execution time of the running SourcePawn VM without pausing the server.\n\n[Take Performance Profile](command:sp-debugger.takeProfile)\n\nReproduce the load, click Cancel to stop, and the capture opens as a flame chart. The tree below shows total / self time and call counts.",
+        "when": "debugType == sp-debugger"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "sp-debugger.takeProfile",
+          "when": "inDebugMode && debugType == sp-debugger"
+        },
+        {
+          "command": "sp-debugger.openFlameChart",
+          "when": "debugType == sp-debugger"
+        },
+        {
+          "command": "sp-debugger.clearProfiler",
+          "when": "debugType == sp-debugger"
+        },
+        {
+          "command": "sp-debugger.profilerToggleMode",
+          "when": "debugType == sp-debugger"
+        },
+        {
+          "command": "sp-debugger.profilerToggleSort",
+          "when": "debugType == sp-debugger"
+        },
+        {
+          "command": "sp-debugger.profilerModeShowFlat",
+          "when": "false"
+        },
+        {
+          "command": "sp-debugger.profilerModeShowTree",
+          "when": "false"
+        },
+        {
+          "command": "sp-debugger.profilerSortShowTotal",
+          "when": "false"
+        },
+        {
+          "command": "sp-debugger.profilerSortShowSelf",
+          "when": "false"
+        },
+        {
+          "command": "sp-debugger.revealProfileFunction",
+          "when": "false"
+        }
+      ],
+      "debug/callstack/context": [
+        {
+          "command": "sp-debugger.takeProfile",
+          "when": "debugType == sp-debugger && callStackItemType == 'session'",
+          "group": "inline"
+        },
+        {
+          "command": "sp-debugger.takeProfile",
+          "when": "debugType == sp-debugger",
+          "group": "navigation@10"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "sp-debugger.takeProfile",
+          "when": "view == spDebuggerProfiler",
+          "group": "navigation@1"
+        },
+        {
+          "command": "sp-debugger.profilerModeShowFlat",
+          "when": "view == spDebuggerProfiler && spDebugger.profilerMode == 'tree'",
+          "group": "navigation@2"
+        },
+        {
+          "command": "sp-debugger.profilerModeShowTree",
+          "when": "view == spDebuggerProfiler && spDebugger.profilerMode == 'flat'",
+          "group": "navigation@2"
+        },
+        {
+          "command": "sp-debugger.profilerSortShowTotal",
+          "when": "view == spDebuggerProfiler && spDebugger.profilerSort == 'self'",
+          "group": "navigation@4"
+        },
+        {
+          "command": "sp-debugger.profilerSortShowSelf",
+          "when": "view == spDebuggerProfiler && spDebugger.profilerSort == 'total'",
+          "group": "navigation@4"
+        },
+        {
+          "command": "sp-debugger.openFlameChart",
+          "when": "view == spDebuggerProfiler",
+          "group": "navigation@5"
+        },
+        {
+          "command": "sp-debugger.clearProfiler",
+          "when": "view == spDebuggerProfiler",
+          "group": "navigation@6"
+        },
+        {
+          "command": "sp-debugger.exportProfileTrace",
+          "when": "view == spDebuggerProfiler",
+          "group": "navigation@5"
+        }
+      ]
+    }
+  },
+  "icon": "icons/icon.jpeg"
+}

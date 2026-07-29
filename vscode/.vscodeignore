@@ -1,0 +1,21 @@
+# Source & build inputs (only compiled out/ is needed at runtime)
+src/**
+**/*.ts
+**/*.map
+tsconfig.json
+.gitignore
+bun.lock
+bunfig.toml
+
+# Tests
+out/**/__tests__/**
+**/__tests__/**
+**/*.test.*
+# Headless DAP dev tools + CI regression tests (repo tooling, not extension runtime)
+scripts/**
+tests/**
+
+# Repo tooling / docs not needed inside the extension
+.github/**
+.vscode/**
+.ruvector/**

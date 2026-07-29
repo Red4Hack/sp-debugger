@@ -1,0 +1,9 @@
+objdir
+vscode/node_modules
+vscode/out
+vscode/*.vsix
+.venv
+.claude
+.ruvector
+bkp
+sp-console-debugger

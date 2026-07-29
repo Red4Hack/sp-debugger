@@ -1,0 +1,47 @@
+# vim: set sts=2 ts=8 sw=2 tw=99 et ft=python:
+import os, sys
+
+# Final binary basename -> sp-debugger.ext.{so,dll} (the project name), not the
+# upstream "console-debugger". The matching sp-debugger.autoload (see
+# PackageScript) makes SourceMod autoload it.
+projectName = 'sp-debugger'
+
+# Upstream sp-console-debugger sources, kept ~pristine so the vendored copy can
+# track https://github.com/peace-maker/sp-console-debugger via patches/.
+upstreamDir = 'sp-console-debugger'
+upstreamFiles = [
+  'breakpoints.cpp',
+  'commands.cpp',
+  'console-helpers.cpp',
+  'debugger.cpp',
+  'extension.cpp',
+  'symbols.cpp',
+]
+
+# Our DAP/TCP/profiler "crate". Everything VS-Code-specific lives here.
+dapDir = 'dap'
+dapFiles = [
+  'config.cpp',
+  'dap-bridge.cpp',
+  'dap-handlers.cpp',
+  'tcp-server.cpp',
+  'json-utils.cpp',
+  'profiler.cpp',
+  'session-manager.cpp',
+  'breakpoint-eval.cpp',
+  'symbol-render.cpp',
+]
+
+sourceFiles = [os.path.join(upstreamDir, f) for f in upstreamFiles]
+sourceFiles += [os.path.join(dapDir, f) for f in dapFiles]
+sourceFiles += [os.path.join(Extension.sm_root, 'public', 'smsdk_ext.cpp')]
+
+###############
+# Make sure to edit PackageScript, which copies your files to their appropriate locations
+# Simple extensions do not need to modify past this point.
+for cxx in builder.targets:
+  binary = Extension.Library(builder, cxx, projectName + '.ext')
+
+  binary.sources += sourceFiles
+
+  Extension.extensions += [builder.Add(binary)]

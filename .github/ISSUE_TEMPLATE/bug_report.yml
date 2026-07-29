@@ -1,0 +1,118 @@
+name: Bug report
+description: The debugger misbehaves, fails to connect, or takes the server down
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. The two details that resolve most issues fastest are
+        **which SourceMod line the server runs** and **how the extension was loaded**,
+        so please do not skip those fields.
+
+        **Never paste your `token`.** If you quote any part of
+        `console-debugger.cfg` or of your launch configuration, redact it first.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      description: Tick what applies. Leaving a box unticked is useful information too.
+      options:
+        - label: The server was fully restarted after deploying the extension (not `sm exts load` / `reload`)
+        - label: The server package matches the server's SourceMod line (`sm1.12` vs `sm1.13`)
+        - label: The patched SourcePawn VM from the release package is installed
+        - label: I can reproduce this with only the debugger extension and the plugin involved
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+      placeholder: |
+        Set a breakpoint on line 42 of antibhop.sp and started the session.
+        Expected: the breakpoint verifies and the server stops on it.
+        Actual: the breakpoint stays hollow and `launch` fails with "...".
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: |
+        Smallest sequence that shows the problem. A minimal plugin helps enormously.
+        If it is a connection problem, say which host and port the editor used.
+      placeholder: |
+        1. Start the server
+        2. F5 in VS Code with a launch configuration pointing at that server
+        3. Trigger the plugin (say hello in chat)
+        4. ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: sm-line
+    attributes:
+      label: SourceMod line
+      options:
+        - "1.12 (stable)"
+        - "1.13 (dev)"
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Server package and `.vsix` you installed, plus the exact SourceMod build.
+      placeholder: "sp-debugger-server-linux-sm1.12 (release 1.0.3), sp-debugger.vsix 1.0.3, SourceMod 1.12.0.7246"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Game server OS
+      options:
+        - Linux
+        - Windows
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: game
+    attributes:
+      label: Game / engine
+      placeholder: "CS:S, TF2, L4D2, ..."
+
+  - type: textarea
+    id: extension-state
+    attributes:
+      label: "`sm exts list` output"
+      description: Run it in the server console. It shows whether the debugger loaded at all.
+      render: text
+      placeholder: |
+        [01] Automatic Updater (1.12.0.7246): ...
+        [03] Console Debugger (0.1.0): Allow debugging plugins through the server console.
+
+  - type: textarea
+    id: debug-console
+    attributes:
+      label: Debug Console output
+      description: |
+        Add `"trace": true` to the launch configuration and reproduce once — it prints the
+        request/response flow the adapter saw.
+      render: text
+
+  - type: textarea
+    id: server-log
+    attributes:
+      label: Server log
+      description: |
+        Relevant lines from the server console and from
+        `addons/sourcemod/logs/errors_*.log`. If the server crashed, include the tail of the
+        console output and, on Linux, a backtrace if you have one
+        (`coredumpctl info` / `gdb -p`).
+      render: text

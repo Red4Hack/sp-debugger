@@ -1,0 +1,104 @@
+name: test
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Fast, dependency-free: the VS Code extension's unit test suite. The
+  # integration test self-skips here (no mock srcds staged in this job).
+  unit:
+    name: unit tests (bun)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Getting own repository
+        uses: actions/checkout@v5
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        working-directory: vscode
+        run: bun install --frozen-lockfile
+
+      - name: Run unit tests
+        working-directory: vscode
+        run: bun test
+
+  build:
+    name: regression test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-multilib g++-multilib libstdc++6 lib32stdc++6 \
+            libc6-dev libc6-dev-i386 linux-libc-dev \
+            linux-libc-dev:i386 lib32z1-dev clang
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "CXX=clang++" >> $GITHUB_ENV
+
+      - name: Getting own repository
+        uses: actions/checkout@v5
+
+      # The vendored sp-console-debugger/ tree is NOT committed -- reconstruct it
+      # from the pinned upstream commit plus our patch (docs/updating-upstream.md).
+      - name: Fetch vendored sp-console-debugger (upstream + patch)
+        run: |
+          set -euo pipefail
+          sha="$(cat patches/sp-console-debugger.commit)"
+          test -n "$sha"
+          git init sp-console-debugger
+          git -C sp-console-debugger fetch --depth 1 https://github.com/peace-maker/sp-console-debugger "$sha"
+          git -C sp-console-debugger reset --hard FETCH_HEAD
+          git -C sp-console-debugger apply --whitespace=nowarn ../patches/sp-console-debugger.patch
+
+      # Restore the mock srcds environment that setup.sh assembles (it lives
+      # inside the reconstructed tree, so this must run after the fetch above).
+      # The key covers setup.sh, which carries the upstream commit pins -- moving
+      # a pin therefore builds a fresh environment instead of reusing a stale one.
+      # Restore/save are split on purpose: a run that fails halfway must not
+      # publish a half-built environment for every later run to inherit.
+      - name: Restore test environment
+        id: mock-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: sp-console-debugger/tests/mock
+          key: ${{ runner.os }}-tests-mock-${{ hashFiles('sp-console-debugger/tests/setup.sh') }}
+
+      - name: Setup test environment
+        working-directory: sp-console-debugger/tests
+        run: ./setup.sh
+
+      - name: Run console regression tests
+        working-directory: sp-console-debugger/tests
+        run: ./run_tests.sh
+
+      # DAP/TCP regression: drives the extension's debug adapter (the dap/ crate)
+      # like the VS Code client would, reusing the mock env built above. The
+      # runner stages the gamedir and then executes the integration test suite
+      # (vscode/src/__tests__/integration/) via bun test.
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install extension dependencies
+        working-directory: vscode
+        run: bun install --frozen-lockfile
+
+      - name: Run DAP regression test
+        run: vscode/tests/dap/run_dap_tests.sh
+
+      - name: Save test environment
+        if: success() && steps.mock-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: sp-console-debugger/tests/mock
+          key: ${{ runner.os }}-tests-mock-${{ hashFiles('sp-console-debugger/tests/setup.sh') }}

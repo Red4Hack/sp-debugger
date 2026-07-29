@@ -1,0 +1,1798 @@
+diff --git a/breakpoints.cpp b/breakpoints.cpp
+index 94d7c71..3c7205a 100644
+--- a/breakpoints.cpp
++++ b/breakpoints.cpp
+@@ -31,48 +31,154 @@
+ 
+ #include "breakpoints.h"
+ #include "debugger.h"
++#include "symbols.h"
++#include "dap-seam.h"
+ #include <iostream>
++#include <cctype>
++#include <cstdlib>
++#include <cstring>
+ 
+ using namespace SourcePawn;
+ 
++BreakpointManager::~BreakpointManager()
++{
++  ClearAllBreakpoints();
++}
++
+ bool
+ BreakpointManager::Initialize()
+ {
++  std::lock_guard<std::mutex> lock(bp_mutex_);
+   return breakpoint_map_.init();
+ }
+ 
+ size_t
+ BreakpointManager::GetBreakpointCount() const
+ {
++  std::lock_guard<std::mutex> lock(bp_mutex_);
+   return breakpoint_map_.elements();
+ }
+ 
+ // Breakpoint handling
+ bool
+-BreakpointManager::CheckBreakpoint(cell_t cip)
++BreakpointManager::CheckBreakpoint(cell_t cip, cell_t frm, Debugger* debugger, std::string* out_log)
+ {
++  // Runs on the VM (main) thread; the map may be mutated concurrently by the
++  // TCP/disconnect thread, so hold the lock for the whole lookup-and-mutate.
++  std::lock_guard<std::mutex> lock(bp_mutex_);
++
+   // See if there's a break point on the current instruction.
+   BreakpointMap::Result result = breakpoint_map_.find(cip);
+   if (!result.found())
+     return false;
+ 
+-  // Remove the temporary breakpoint
+-  if (result->value->temporary()) {
+-    ClearBreakpoint(result->value);
++  Breakpoint* bp = result->value;
++
++  // Evaluate a conditional expression if one is attached. A condition that
++  // can't be parsed or evaluated yields false so the program keeps running
++  // rather than stopping unexpectedly.
++  if (debugger && !bp->GetCondition().empty()) {
++    if (!dap::EvalBreakpointCondition(debugger, bp->GetCondition(), cip, frm))
++      return false;
+   }
+ 
+-  return true;
++  // Honour hit counts: only stop once the breakpoint has been reached the
++  // requested number of times.
++  bp->IncrementHitCount();
++  if (bp->GetHitCondition() > 0 && bp->GetHitCount() < bp->GetHitCondition())
++    return false;
++
++  // Logpoint: format the message and continue WITHOUT stopping. This lets the
++  // user observe values from a live plugin (e.g. an anti-cheat) without
++  // freezing the whole game server, which a real pause would do.
++  const bool is_logpoint = !bp->GetLogMessage().empty();
++  if (is_logpoint && out_log && debugger)
++    *out_log = dap::FormatLogpointMessage(debugger, bp->GetLogMessage(), cip, frm);
++
++  // Temporary breakpoints are one-shot regardless of being a logpoint.
++  // (Deletes bp; don't touch it afterwards.)
++  if (bp->temporary())
++    ClearBreakpointLocked(bp);
++
++  // A logpoint never stops execution.
++  return !is_logpoint;
+ }
+ 
+ Breakpoint *
+ BreakpointManager::AddBreakpoint(const std::string& file, cell_t line, bool temporary)
+ {
++  std::lock_guard<std::mutex> lock(bp_mutex_);
++
+   Breakpoint *bp;
+   {
+     ucell_t addr;
++    bool was_snapped = false;
+     IPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
+-    if (debuginfo->LookupLineAddress(line, file.c_str(), &addr) != SP_ERROR_NONE)
+-      return nullptr;
++
++    // The client (VS Code) sends an absolute local path, but the debug info
++    // stores the path as seen by the compiler (e.g. "antibhop.sp" or
++    // "./addons/.../antibhop.sp"). Resolve to the matching debug file by its
++    // basename (suffix match), the same way the console "break file:line"
++    // command does -- otherwise LookupLineAddress never matches and the
++    // breakpoint can't bind.
++    std::string lookup_file = file;
++    size_t slash = file.find_last_of("/\\");
++    std::string basename = (slash == std::string::npos) ? file : file.substr(slash + 1);
++    const char* resolved = debugger_->FindFileByPartialName(basename);
++    if (resolved)
++      lookup_file = resolved;
++
++    if (debuginfo->LookupLineAddress(line, lookup_file.c_str(), &addr) != SP_ERROR_NONE) {
++      // The requested line has no executable code (blank line, comment, brace).
++      // Snap to the nearest executable line within a small radius, preferring
++      // lines below the request, like a C/C++ debugger does.
++      bool snapped = false;
++      for (cell_t offset = 1; offset <= 5 && !snapped; offset++) {
++        if (debuginfo->LookupLineAddress(line + offset, lookup_file.c_str(), &addr) == SP_ERROR_NONE) {
++          line += offset;
++          snapped = true;
++        } else if (line >= offset &&
++                   debuginfo->LookupLineAddress(line - offset, lookup_file.c_str(), &addr) == SP_ERROR_NONE) {
++          line -= offset;
++          snapped = true;
++        }
++      }
++      if (!snapped)
++        return nullptr;
++      was_snapped = true;
++    }
++
++    // If the breakpoint landed on a function's entry (the prologue / signature
++    // line), advance it to the first line of the body. At the prologue the
++    // debug info reports no parameters or locals in scope yet, so stopping
++    // there shows an empty Variables view and forces the user to step in. We
++    // detect the prologue by comparing the resolved address with the function's
++    // start address; if they match we move to the next line whose address is
++    // past the prologue but still inside the same function.
++    // Skip this when the line was snapped from an empty line: the snap may have
++    // crossed into a neighbouring function, so we shouldn't second-guess it.
++    const char* entry_func = nullptr;
++    if (!was_snapped &&
++        debuginfo->LookupFunction(addr, &entry_func) == SP_ERROR_NONE && entry_func) {
++      uint32_t func_start = 0;
++      if (debuginfo->LookupFunctionAddress(entry_func, lookup_file.c_str(), &func_start) == SP_ERROR_NONE &&
++          addr == func_start) {
++        for (cell_t offset = 1; offset <= 20; offset++) {
++          ucell_t body_addr;
++          if (debuginfo->LookupLineAddress(line + offset, lookup_file.c_str(), &body_addr) == SP_ERROR_NONE &&
++              body_addr > func_start) {
++            const char* body_func = nullptr;
++            // Stay within the same function (don't fall into the next one).
++            if (debuginfo->LookupFunction(body_addr, &body_func) == SP_ERROR_NONE &&
++                body_func && strcmp(body_func, entry_func) == 0) {
++              addr = body_addr;
++              line += offset;
++            }
++            break;
++          }
++        }
++      }
++    }
+ 
+     // See if there's already a breakpoint in place here.
+     BreakpointMap::Insert p = breakpoint_map_.findForAdd(addr);
+@@ -92,9 +198,12 @@ BreakpointManager::AddBreakpoint(const std::string& file, cell_t line, bool temp
+ Breakpoint *
+ BreakpointManager::AddBreakpoint(const std::string& file, const std::string& function, bool temporary)
+ {
+-  std::string targetfile = debugger_->FindFileByPartialName(file);
+-  if (targetfile.empty())
++  // FindFileByPartialName returns a const char* that may be null; constructing
++  // a std::string from null is undefined behaviour, so guard it explicitly.
++  const char* found = debugger_->FindFileByPartialName(file);
++  if (!found)
+     return nullptr;
++  std::string targetfile = found;
+ 
+   IPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
+   // Is there a function named like that in the file?
+@@ -102,6 +211,8 @@ BreakpointManager::AddBreakpoint(const std::string& file, const std::string& fun
+   if (debuginfo->LookupFunctionAddress(function.c_str(), targetfile.c_str(), &addr) != SP_ERROR_NONE)
+     return nullptr;
+ 
++  std::lock_guard<std::mutex> lock(bp_mutex_);
++
+   Breakpoint *bp;
+   {
+     // See if there's already a breakpoint in place here.
+@@ -125,9 +236,11 @@ BreakpointManager::ClearBreakpoint(int number)
+   if (number <= 0)
+     return false;
+ 
++  std::lock_guard<std::mutex> lock(bp_mutex_);
+   int i = 0;
+   for (BreakpointMap::iterator iter = breakpoint_map_.iter(); !iter.empty(); iter.next()) {
+     if (++i == number) {
++      delete iter->value;   // free the Breakpoint before dropping the entry
+       iter.erase();
+       return true;
+     }
+@@ -137,11 +250,19 @@ BreakpointManager::ClearBreakpoint(int number)
+ 
+ bool
+ BreakpointManager::ClearBreakpoint(Breakpoint * bp)
++{
++  std::lock_guard<std::mutex> lock(bp_mutex_);
++  return ClearBreakpointLocked(bp);
++}
++
++bool
++BreakpointManager::ClearBreakpointLocked(Breakpoint * bp)
+ {
+   BreakpointMap::Result res = breakpoint_map_.find(bp->addr());
+   if (!res.found())
+     return false;
+ 
++  delete res->value;        // free the Breakpoint before dropping the entry
+   breakpoint_map_.remove(res);
+   return true;
+ }
+@@ -149,6 +270,17 @@ BreakpointManager::ClearBreakpoint(Breakpoint * bp)
+ void
+ BreakpointManager::ClearAllBreakpoints()
+ {
++  std::lock_guard<std::mutex> lock(bp_mutex_);
++  ClearAllBreakpointsLocked();
++}
++
++void
++BreakpointManager::ClearAllBreakpointsLocked()
++{
++  // Free every Breakpoint object first; HashMap::clear() only drops the
++  // pointers, it does not own them.
++  for (BreakpointMap::iterator iter = breakpoint_map_.iter(); !iter.empty(); iter.next())
++    delete iter->value;
+   breakpoint_map_.clear();
+ }
+ 
+@@ -172,6 +304,7 @@ BreakpointManager::FindBreakpoint(const std::string& input)
+   uint32_t line;
+   uint32_t number = 0;
+   IPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
++  std::lock_guard<std::mutex> lock(bp_mutex_);
+   for (BreakpointMap::iterator iter = breakpoint_map_.iter(); !iter.empty(); iter.next()) {
+     bp = iter->value;
+     if (debuginfo->LookupFile(bp->addr(), &fname) != SP_ERROR_NONE)
+@@ -200,6 +333,7 @@ BreakpointManager::ListBreakpoints()
+   uint32_t line;
+   const char *filename;
+   uint32_t number = 0;
++  std::lock_guard<std::mutex> lock(bp_mutex_);
+   for (BreakpointMap::iterator iter = breakpoint_map_.iter(); !iter.empty(); iter.next()) {
+     bp = iter->value;
+ 
+diff --git a/breakpoints.h b/breakpoints.h
+index 3594b21..9ae26d9 100644
+--- a/breakpoints.h
++++ b/breakpoints.h
+@@ -35,6 +35,7 @@
+ #include <sp_vm_api.h>
+ #include "amtl/am-hashmap.h"
+ #include <string>
++#include <mutex>
+ #include "console-helpers.h"
+ 
+ class Breakpoint;
+@@ -43,18 +44,45 @@ class Debugger;
+ class BreakpointManager {
+ public:
+   BreakpointManager(Debugger* debugger) : debugger_(debugger) {}
++  ~BreakpointManager();
+   bool Initialize();
+   Breakpoint *AddBreakpoint(const std::string& file, cell_t line, bool temporary);
+   Breakpoint *AddBreakpoint(const std::string& file, const std::string& function, bool temporary);
+   bool ClearBreakpoint(int number);
+   bool ClearBreakpoint(Breakpoint *);
+   void ClearAllBreakpoints();
+-  bool CheckBreakpoint(cell_t cip);
++  // Decide whether execution should stop at this address. When a debugger is
++  // supplied, conditional expressions and hit counts are evaluated using the
++  // given frame (cip/frm of the current break); otherwise any matching
++  // breakpoint stops unconditionally (console behaviour).
++  // Decide whether execution should stop at this address. When a debugger is
++  // supplied, conditional expressions and hit counts are evaluated using the
++  // given frame. If the matched breakpoint is a *logpoint* (has a log message),
++  // the interpolated message is written to *out_log and the function returns
++  // false (execution continues without freezing the server).
++  bool CheckBreakpoint(cell_t cip, cell_t frm = 0, Debugger* debugger = nullptr,
++                       std::string* out_log = nullptr);
+   int FindBreakpoint(const std::string& breakpoint);
+   void ListBreakpoints();
+   const std::string ParseBreakpointLine(const std::string& input, std::string* filename);
+   size_t GetBreakpointCount() const;
+ 
++private:
++  // Conditional-breakpoint and logpoint evaluation now lives in the DAP crate
++  // (dap/breakpoint-eval.cpp), invoked through dap::EvalBreakpointCondition /
++  // dap::FormatLogpointMessage from CheckBreakpoint -- see dap/dap-seam.h.
++
++  // Map mutations without taking bp_mutex_ (caller already holds it). Both also
++  // free the Breakpoint object they remove.
++  bool ClearBreakpointLocked(Breakpoint* bp);
++  void ClearAllBreakpointsLocked();
++
++  // Serialises every access to breakpoint_map_. The VM (main) thread reads it
++  // in CheckBreakpoint on (almost) every line, while the TCP/disconnect thread
++  // mutates it via AddBreakpoint / ClearAllBreakpoints (Deactivate) -- without
++  // this lock that was a use-after-free.
++  mutable std::mutex bp_mutex_;
++
+ public:
+   struct BreakpointMapPolicy {
+ 
+@@ -77,7 +105,8 @@ public:
+     : debuginfo_(debuginfo),
+     addr_(addr),
+     name_(name),
+-    temporary_(temporary)
++    temporary_(temporary),
++    hit_count_(0)
+   {}
+ 
+   ucell_t addr() {
+@@ -101,11 +130,30 @@ public:
+       return line;
+     return 0;
+   }
++  
++  void SetCondition(const std::string& condition) { condition_ = condition; }
++  std::string GetCondition() const { return condition_; }
++  
++  void SetHitCondition(int hit_condition) { hit_condition_ = hit_condition; }
++  int GetHitCondition() const { return hit_condition_; }
++
++  // Logpoint message ("{expr}" placeholders are interpolated). When set, the
++  // breakpoint logs and continues instead of stopping.
++  void SetLogMessage(const std::string& msg) { log_message_ = msg; }
++  const std::string& GetLogMessage() const { return log_message_; }
++  
++  void IncrementHitCount() { hit_count_++; }
++  int GetHitCount() const { return hit_count_; }
++  
+ private:
+   SourcePawn::IPluginDebugInfo * debuginfo_; /* debug info of plugin the address is in */
+   ucell_t addr_; /* address (in code or data segment) */
+   const char *name_; /* name of the symbol (function) */
+   bool temporary_; /* delete breakpoint when hit? */
++  std::string condition_; /* conditional expression */
++  int hit_condition_ = 0; /* hit count condition */
++  int hit_count_ = 0; /* number of times hit */
++  std::string log_message_; /* logpoint message; empty for normal breakpoints */
+ };
+ 
+ #endif // _INCLUDE_DEBUGGER_BREAKPOINT_H
+diff --git a/commands.cpp b/commands.cpp
+index cd7e900..2482c05 100644
+--- a/commands.cpp
++++ b/commands.cpp
+@@ -30,6 +30,7 @@
+ */
+ #include "commands.h"
+ #include "debugger.h"
++#include "frame-utils.h"
+ #include <iostream>
+ #include <amtl/am-string.h>
+ #include <smx/smx-legacy-debuginfo.h>
+@@ -459,36 +460,8 @@ FilesCommand::Accept(const std::string& command, const std::string& params) {
+   return CR_StayCommandLoop;
+ }
+ 
+-// Hack to access data in the VM currently not exposed to extensions.
+-// Highly depends on the VM version.
+-// TODO: Find a way to safely expose this "implementation detail".
+-namespace sp {
+-  class InlineFrameIterator
+-  {
+-  public:
+-    virtual ~InlineFrameIterator()
+-    {}
+-
+-    // "done" should return true if, after the current frame, there are no more
+-    // frames to iterate.
+-    virtual bool done() const = 0;
+-    virtual void next() = 0;
+-    virtual int type() const = 0;
+-    virtual cell_t function_cip() const = 0;
+-    virtual cell_t cip() const = 0;
+-    virtual uint32_t native_index() const = 0;
+-  };
+-
+-  class FrameIteratorHack
+-  {
+-  public:
+-    virtual void somefunc() = 0;
+-    void* ivk_;
+-    void* runtime_;
+-    intptr_t* next_exit_fp_;
+-    std::unique_ptr<InlineFrameIterator> frame_cursor_;
+-  };
+-}
++// VM-internal access helpers (sp::FrameIteratorHack / ReadContextFramePointer)
++// live in frame-utils.h so the DAP handlers can reuse the exact same logic.
+ 
+ CommandResult
+ FrameCommand::Accept(const std::string& command, const std::string& params) {
+@@ -550,7 +523,7 @@ FrameCommand::Accept(const std::string& command, const std::string& params) {
+   debugger_->basectx()->DestroyFrameIterator(frames);
+ 
+   // TODO: Properly expose this from the VM :D
+-  cell_t frm = *(cell_t*)(uintptr_t(ctx) + sizeof(void*)*10 + sizeof(bool)*4 + sizeof(uint32_t)*2 + sizeof(cell_t)*3);
++  cell_t frm = sp::ReadContextFramePointer(ctx);
+   // Find correct new frame pointer.
+   cell_t* ptr;
+   for (uint32_t i = 1; i < num_scripted_frames; i++) {
+diff --git a/debugger.cpp b/debugger.cpp
+index 987148d..aca503d 100644
+--- a/debugger.cpp
++++ b/debugger.cpp
+@@ -29,14 +29,25 @@
+ * Version: $Id$
+ */
+ #include "debugger.h"
++#include "extension.h"
+ #include "commands.h"
+ #include "breakpoints.h"
+ #include "symbols.h"
++#include "frame-utils.h"
++#include "dap-seam.h"
+ #include <amtl/am-string.h>
+ #include <ctype.h>
+ #include <iterator>
+ #include <iostream>
+ #include <sstream>
++#include <cstdio>
++#include <cstring>
++#ifdef KE_POSIX
++#include <unistd.h>
++#include <fcntl.h>
++#else
++#include <io.h>
++#endif
+ 
+ using namespace SourcePawn;
+ 
+@@ -98,6 +109,7 @@ void
+ Debugger::Deactivate()
+ {
+   active_ = false;
++  owner_token_ = nullptr;
+ 
+   breakpoints_.ClearAllBreakpoints();
+   symbols_.ClearAllWatches();
+@@ -110,12 +122,84 @@ Debugger::GetDebugInfo() const
+   return selected_context_->GetRuntime()->GetDebugInfo();
+ }
+ 
++bool
++Debugger::SelectFrame(uint32_t frame_id)
++{
++  // NOTE: We do NOT use the cip reported by the debug-break hook (break_cip_)
++  // even for frame 0. After a step that value can point outside the scripted
++  // frame's code range (e.g. into a callee / VM glue), which makes the symbol
++  // iterator return no locals and only the always-visible globals -- the
++  // "Locals always empty / Globals shrink to 5" bug. Instead we always read the
++  // cip straight from the frame iterator, exactly like the stackTrace handler,
++  // so symbol scope lookups line up with the line shown in the editor.
++
++  // Walk to the requested frame, counting only non-internal frames so the
++  // index matches the ids handed out by the stackTrace handler.
++  IFrameIterator *frames = context_->CreateFrameIterator();
++  int dap_index = -1;
++  bool found = false;
++  for (; !frames->Done(); frames->Next()) {
++    if (frames->IsInternalFrame())
++      continue;
++    if (static_cast<uint32_t>(++dap_index) == frame_id) {
++      found = true;
++      break;
++    }
++  }
++
++  if (!found || !frames->IsScriptedFrame()) {
++    // Native or out-of-range frames have no scripted locals to inspect.
++    context_->DestroyFrameIterator(frames);
++    return false;
++  }
++
++  IPluginContext *ctx = frames->Context();
++
++  // Extract the code instruction pointer of the selected frame.
++  // FIXME: Properly expose this from the VM :D
++  sp::FrameIteratorHack *frames_hack = reinterpret_cast<sp::FrameIteratorHack *>(frames);
++  cell_t cip = frames_hack->frame_cursor_->cip();
++
++  // Reset and count the scripted frames in this context up to (and including)
++  // the chosen frame, so we can follow the saved frame-pointer chain.
++  frames->Reset();
++  dap_index = -1;
++  uint32_t num_scripted_frames = 0;
++  for (; !frames->Done(); frames->Next()) {
++    if (frames->IsInternalFrame())
++      continue;
++    if (frames->IsScriptedFrame() && frames->Context() == ctx)
++      num_scripted_frames++;
++    if (static_cast<uint32_t>(++dap_index) == frame_id)
++      break;
++  }
++  context_->DestroyFrameIterator(frames);
++
++  // Follow the frame-pointer chain to the selected frame, starting at the frame
++  // we actually stopped in. The debug-break hook hands us that frame pointer
++  // (break_frm_), and it is the only value guaranteed to describe the currently
++  // executing scripted frame: the frame pointer stored in the context tracks
++  // native-call boundaries, so mid-function it can still hold an older frame and
++  // every local then resolves against the wrong base and reads back as 0.
++  // Contexts other than the one that broke have no such report, so those still
++  // have to go through the layout hack.
++  // TODO: Properly expose this from the VM :D
++  cell_t frm = (ctx == context_ && break_frm_ != 0) ? break_frm_
++                                                    : sp::ReadContextFramePointer(ctx);
++  cell_t *ptr;
++  for (uint32_t i = 1; i < num_scripted_frames; i++) {
++    if (ctx->LocalToPhysAddr(frm + 4, &ptr) != SP_ERROR_NONE)
++      return false;
++    frm = *ptr;
++  }
++
++  UpdateSelectedContext(ctx, frame_id, cip, frm);
++  return true;
++}
++
+ void
+ Debugger::HandleInput(cell_t cip, cell_t frm, bool isBp)
+ {
+-  // Remember which command was executed last,
+-  // so you don't have to type it again if you
+-  // want to repeat it.
+   static std::string lastcommand = "";
+ 
+   // Reset the state.
+@@ -127,8 +211,11 @@ Debugger::HandleInput(cell_t cip, cell_t frm, bool isBp)
+   selected_context_ = context_;
+   is_breakpoint_ = isBp;
+ 
++  // Remember the stop location so SelectFrame(0) can restore it cheaply.
++  break_cip_ = cip;
++  break_frm_ = frm;
++
+   // Count the frames
+-  // Select first scripted frame, if it's not frame 0
+   bool selected_first_scripted = false;
+   for (; !frames->Done(); frames->Next(), frame_count_++) {
+     if (frames->IsInternalFrame())
+@@ -142,42 +229,60 @@ Debugger::HandleInput(cell_t cip, cell_t frm, bool isBp)
+ 
+   context_->DestroyFrameIterator(frames);
+ 
+-  // Show where we've stopped.
+-  PrintCurrentPosition();
++  // Check if we're in TCP/DAP mode (VS Code debugging). If so, hand the stop to
++  // the DAP crate: it emits the "stopped" event and blocks here until the client
++  // continues/steps or disconnects (see dap::OnBreak). A pending VM exception
++  // takes priority so the error surfaces in VS Code (reason "exception").
++  if (dap::HasClients()) {
++    const char *reason = has_exception() ? "exception"
++                         : (is_breakpoint_ ? "breakpoint" : "step");
++    dap::OnBreak(this, reason);
++    return;
++  }
+ 
+-  // Print all watched variables now.
++  // No TCP client AND stdin is not an interactive terminal: this is a headless
++  // game server where the previous DAP client just disconnected mid-break (a
++  // break was already in flight on the VM thread when Deactivate raced it).
++  // Dropping into the interactive "dbg>" prompt here would call
++  // std::getline(std::cin) on a non-TTY -- best case it spews console noise and
++  // returns EOF, worst case it blocks and freezes the server. Resume instead.
++#ifdef KE_POSIX
++  const bool stdin_is_tty = isatty(fileno(stdin)) != 0;
++#else
++  const bool stdin_is_tty = _isatty(_fileno(stdin)) != 0;
++#endif
++  if (!stdin_is_tty) {
++    SetRunmode(RUNNING);
++    return;
++  }
++
++  // Console mode: Show prompt and handle input interactively
++  PrintCurrentPosition();
+   symbols_.ListWatches();
+ 
+   std::string line, command, params;
+   for (;;) {
+-    // Show a debugger prompt.
+     std::cout << "dbg> ";
+ 
+-    // Read debugger command.
+     if (!std::getline(std::cin, line)) {
+-      // Ctrl+C? Not sure what's the best behavior here.
+       SetRunmode(RUNNING);
+       std::cout << std::endl;
+       break;
+     }
+     line = trimString(line);
+ 
+-    // Repeat the last command, if no new command was given.
+     if (line.empty()) {
+       line = lastcommand;
+     }
+     lastcommand.clear();
+ 
+-    // Split the line into "<command> <params...>"
+     size_t pos = line.find_first_of(" ");
+     if (pos == std::string::npos) {
+       command = line;
+       params = "";
+     }
+     else {
+-      // Extract the first word from the string.
+       command = line.substr(0, pos);
+-      // Optional params start after the command.
+       params = line.substr(pos + 1);
+       params = trimString(params);
+     }
+@@ -187,7 +292,6 @@ Debugger::HandleInput(cell_t cip, cell_t frm, bool isBp)
+       continue;
+     }
+ 
+-    // Handle inbuilt help command.
+     if (!stricmp(command.c_str(), "?") || !stricmp(command.c_str(), "help")) {
+       ListCommands(params);
+       continue;
+@@ -202,13 +306,8 @@ Debugger::HandleInput(cell_t cip, cell_t frm, bool isBp)
+     if (matched_cmd->Accept(command, params) == CR_LeaveCommandLoop) {
+       return;
+     }
+-    
+-    /*
+-    // Change display format of symbol
+-    else if (!stricmp(command, "type")) {
+-      HandleDisplayFormatChangeCmd(params);
+-    }*/
+   }
++
+ }
+ 
+ std::shared_ptr<DebuggerCommand>
+@@ -248,6 +347,119 @@ Debugger::ResolveCommandString(const std::string command)
+   return matched_cmds[0];
+ }
+ 
++bool
++Debugger::IsConsoleCommandToken(const std::string& token)
++{
++  if (token.empty())
++    return false;
++  if (token == "?" || token == "help")
++    return true;
++  for (auto& cmd : commands_) {
++    if (!cmd->GetMatch(token).empty())
++      return true;
++  }
++  return false;
++}
++
++std::string
++Debugger::ExecuteReplCommand(const std::string& raw_line)
++{
++  std::string line = raw_line;
++  trimString(line);
++  if (line.empty())
++    return "";
++
++  // Split into command + params exactly like the interactive console loop.
++  std::string command, params;
++  size_t pos = line.find_first_of(" ");
++  if (pos == std::string::npos) {
++    command = line;
++  } else {
++    command = line.substr(0, pos);
++    params = line.substr(pos + 1);
++    trimString(params);
++  }
++
++  // Refuse execution-control commands: resuming/stepping must go through the
++  // DAP request path (continue/next/stepIn/stepOut) so the adapter emits the
++  // matching continued/stopped events and keeps its state in sync. Running them
++  // here would resume the VM behind the adapter's back.
++  std::string lower = command;
++  for (char& c : lower) c = static_cast<char>(tolower((unsigned char)c));
++  static const char* kBlocked[] = {
++    "continue", "c", "next", "n", "step", "s", "finish", "stepout",
++    "quit", "q", "exit"
++  };
++  for (const char* b : kBlocked) {
++    if (lower == b)
++      return "Use the debug toolbar (Continue/Step Over/Step Into/Step Out) for "
++             "execution control -- running \"" + command + "\" from the console "
++             "would desync the debugger. Inspection commands (bt, p <var>, x, "
++             "files, funcs, watch, ?) work here.";
++  }
++
++  // Capture everything written to stdout (std::cout AND printf/fputs all go to
++  // fd 1) while the command runs, by redirecting fd 1 to a pipe. The VM is
++  // parked at a breakpoint and the game's main thread is blocked, so concurrent
++  // stdout is minimal during this short window.
++#ifdef KE_POSIX
++  std::cout.flush();
++  fflush(stdout);
++
++  int pipefd[2];
++  int saved_stdout = -1;
++  bool capturing = false;
++  if (pipe(pipefd) == 0) {
++    saved_stdout = dup(STDOUT_FILENO);
++    if (saved_stdout != -1 && dup2(pipefd[1], STDOUT_FILENO) != -1) {
++      // Non-blocking read end so draining can't deadlock if nothing was written.
++      int flags = fcntl(pipefd[0], F_GETFL, 0);
++      fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
++      capturing = true;
++    }
++    close(pipefd[1]); // the write end is now duped onto fd 1
++  }
++
++  // Run the command (or help), mirroring the console loop's dispatch.
++  if (command == "?" || command == "help") {
++    ListCommands(params);
++  } else {
++    std::shared_ptr<DebuggerCommand> matched_cmd = ResolveCommandString(command);
++    if (matched_cmd)
++      matched_cmd->Accept(command, params);
++  }
++
++  std::string output;
++  if (capturing) {
++    std::cout.flush();
++    fflush(stdout);
++    // Restore fd 1 before draining so we don't capture our own reads.
++    dup2(saved_stdout, STDOUT_FILENO);
++    close(saved_stdout);
++
++    char buf[4096];
++    ssize_t n;
++    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
++      output.append(buf, n);
++      if (output.size() > 64 * 1024) // cap pathological output
++        break;
++    }
++    close(pipefd[0]);
++  }
++  return output;
++#else
++  // Non-POSIX: stdout-fd capture not implemented; run without capture.
++  if (command == "?" || command == "help") {
++    ListCommands(params);
++  } else {
++    std::shared_ptr<DebuggerCommand> matched_cmd = ResolveCommandString(command);
++    if (matched_cmd)
++      matched_cmd->Accept(command, params);
++  }
++  return "";
++#endif
++}
++
+ void
+ Debugger::ListCommands(const std::string command)
+ {
+diff --git a/debugger.h b/debugger.h
+index e5f629a..8ce4e56 100644
+--- a/debugger.h
++++ b/debugger.h
+@@ -34,12 +34,15 @@
+ 
+ #include <string>
+ #include <vector>
++#include <memory>
++#include <atomic>
+ 
+ #include "sp_vm_api.h"
+ #include "amtl/am-hashmap.h"
+ #include "console-helpers.h"
+ #include "breakpoints.h"
+ #include "symbols.h"
++#include "dap-seam.h"
+ 
+ enum Runmode {
+   STEPPING, /* step into functions */
+@@ -59,11 +62,29 @@ public:
+   }
+   void Activate();
+   void Deactivate();
++
++  // Identifies the DAP client that owns the current debug session. Disconnect
++  // cleanup is scoped to the owning client so that a late/stale disconnect from
++  // a previous client cannot tear down a newer client's active session (which
++  // left breakpoints verified but never firing). An opaque token avoids pulling
++  // the ClientConnection definition into this header.
++  void SetOwnerToken(const void* token) { owner_token_ = token; }
++  const void* OwnerToken() const { return owner_token_; }
+   SourcePawn::IPluginDebugInfo* GetDebugInfo() const;
+ 
+   void HandleInput(cell_t cip, cell_t frm, bool isBp);
+   void ListCommands(const std::string command);
+ 
++  // Run a console debugger command line (the same commands as the "dbg>"
++  // prompt) on behalf of the VS Code Debug Console REPL, capturing everything
++  // the command writes to stdout (both std::cout and printf/fputs) and
++  // returning it as a string. Execution-control commands (continue/step/quit)
++  // are refused with a hint, since resuming must go through the DAP flow to keep
++  // the adapter's state in sync. Returns the captured output (may be empty).
++  std::string ExecuteReplCommand(const std::string& line);
++  // True if `token` names a console command (no output / side effects).
++  bool IsConsoleCommandToken(const std::string& token);
++
+ private:
+   //void HandleFrameCmd(char *params);
+   //void HandleDisplayFormatChangeCmd(char *params);
+@@ -72,8 +93,17 @@ public:
+   Runmode runmode() const {
+     return runmode_;
+   }
++
++  // Check if debugger is in any paused/stepping state
++  bool IsPaused() const {
++    return runmode_ == STEPPING || runmode_ == STEPOVER || runmode_ == STEPOUT;
++  }
++
+   void SetRunmode(Runmode runmode) {
+     runmode_ = runmode;
++    // Wake the VM thread if it is paused in the DAP break loop (no-op outside
++    // DAP mode). Any runmode change is a resume/step issued by the client.
++    dap::NotifyResume();
+   }
+   cell_t lastframe() const {
+     return lastfrm_;
+@@ -130,22 +160,56 @@ public:
+     frm_ = frm;
+   }
+ 
++  // Select the stack frame identified by a DAP frame id (the index of a
++  // non-internal frame as reported by the stackTrace handler) and update the
++  // selected context so symbol lookups resolve against that frame. Returns
++  // false when the frame can't be selected (e.g. a native frame). Frame 0 is
++  // the stop location and is restored without touching VM internals.
++  bool SelectFrame(uint32_t frame_id);
++
+   void DumpStack();
+   void PrintCurrentPosition();
+   const char* FindFileByPartialName(const std::string partialname);
++  
++  void SetManualPause(bool pause) { manual_pause_ = pause; }
++  bool IsManualPause() const { return manual_pause_; }
++
++  // Pending VM exception/error captured at the last break. When set, the next
++  // stop is reported to the client with reason "exception" and this text, so a
++  // SourceMod runtime error (e.g. "Not enough space on the heap") surfaces in
++  // VS Code instead of only the server log. Cleared once the stop is handled.
++  void SetException(const char *message, bool fatal) {
++    exception_text_ = message ? message : "";
++    exception_fatal_ = fatal;
++  }
++  void ClearException() {
++    exception_text_.clear();
++    exception_fatal_ = false;
++  }
++  bool has_exception() const { return !exception_text_.empty(); }
++  const std::string &exception_text() const { return exception_text_; }
++  bool exception_fatal() const { return exception_fatal_; }
+ 
+ private:
+   std::shared_ptr<DebuggerCommand> ResolveCommandString(const std::string command);
+ 
+ private:
+   SourcePawn::IPluginContext * context_;
+-  Runmode runmode_;
++  // Read/written by both the VM (main) thread and the TCP thread (continue/step
++  // handlers), so it must be atomic to avoid a data race / torn reads.
++  std::atomic<Runmode> runmode_;
+   cell_t lastfrm_;
+   uint32_t lastline_;
+   const char *currentfile_;
+   const char *currentfunction_;
+   bool is_breakpoint_;
+-  bool active_;
++  std::string exception_text_;
++  bool exception_fatal_ = false;
++  // Read on the VM (main) thread every break (OnDebugBreak gate) and written on
++  // the TCP thread (Activate/Deactivate), so it must be atomic.
++  std::atomic<bool> active_;
++  std::atomic<const void*> owner_token_{nullptr};
++  bool manual_pause_ = false;
+   std::vector<std::shared_ptr<DebuggerCommand>> commands_;
+   BreakpointManager breakpoints_;
+   SymbolManager symbols_;
+@@ -156,6 +220,12 @@ private:
+   uint32_t frame_count_;
+   uint32_t selected_frame_;
+   SourcePawn::IPluginContext *selected_context_;
++
++  // Stop location captured on entry to HandleInput (DAP frame 0). Used to
++  // restore the selected context to the break frame without touching VM
++  // internals.
++  cell_t break_cip_ = 0;
++  cell_t break_frm_ = 0;
+ };
+ 
+ #endif // _INCLUDE_DEBUGGER_H
+diff --git a/extension.cpp b/extension.cpp
+index c425782..2003795 100644
+--- a/extension.cpp
++++ b/extension.cpp
+@@ -31,12 +31,22 @@
+ 
+ #include <memory>
+ #include <string>
++#include <sstream>
++#include <iostream>
++#include <vector>
++#include <utility>
++#include <algorithm>
++#include <chrono>
+ 
+ #include "extension.h"
+ #include "debugger.h"
+ #include "console-helpers.h"
++#include "dap-seam.h"
+ #include <amtl/am-platform.h>
+ #include <amtl/os/am-shared-library.h>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ #ifdef KE_POSIX
+ #include <ctype.h>
+ #endif
+@@ -50,14 +60,36 @@ using namespace ke;
+ 
+ ConsoleDebugger g_Debugger;		/**< Global singleton for extension's main interface */
+ 
++// Verbose per-message diagnostics ([SM] DAP ..., [TCP] ..., and the
++// [profiler-init] info lines) are OFF by default to keep the server console
++// clean. Flip on with `"debug_log" "1"` in
++// addons/sourcemod/configs/console-debugger.cfg. Errors ([profiler-init]
++// FAILED, etc.), the one-time startup banner, and client connect/disconnect
++// notices always print regardless.
++bool g_DebugLogging = false;
++
+ SMEXT_LINK(&g_Debugger);
+ 
+ void OnDebugBreak(IPluginContext *ctx, sp_debug_break_info_t& dbginfo, const SourcePawn::IErrorReport *report);
+ 
+-#if defined PLATFORM_X86
+-# define SOURCEPAWN_DLL "sourcepawn.jit.x86"
+-#else
++// The verbose-logging flag lives in configs/console-debugger.cfg alongside the
++// DAP settings, so it is read through the crate's config parser (dap-seam.h)
++// rather than a second scanner maintained here.
++static bool LoadDebugLoggingFlag()
++{
++    return dap::ConfigFlag("debug_log", false);
++}
++
++// Pick the VM library basename by architecture. NOTE: SourceMod's PLATFORM_X86
++// macro is NOT reliably defined in this build, so a 32-bit (x86) build wrongly
++// fell through to "sourcepawn.vm" and failed to open the VM (the 32-bit VM is
++// "sourcepawn.jit.x86"). Detect the bitness from the compiler instead:
++//   64-bit -> sourcepawn.vm          (in bin/x64/)
++//   32-bit -> sourcepawn.jit.x86     (in bin/)
++#if defined(__x86_64__) || defined(_M_X64) || defined(__amd64__) || defined(__aarch64__)
+ # define SOURCEPAWN_DLL "sourcepawn.vm"
++#else
++# define SOURCEPAWN_DLL "sourcepawn.jit.x86"
+ #endif
+ 
+ bool
+@@ -75,27 +107,49 @@ ConsoleDebugger::SDK_OnLoad(char *error, size_t maxlength, bool late)
+     return false;
+   }
+ 
+-  if (!late)
++  // Load the verbose-logging flag early (before the profiler-init block below)
++  // so its diagnostics can be gated by it. Opt in with `"debug_log" "1"`.
++  g_DebugLogging = LoadDebugLoggingFlag();
++
++  // The v2 SourcePawn engine, captured below and handed to the DAP layer so its
++  // "All plugins" profiler can register a profiling tool. Null if unavailable.
++  SourcePawn::ISourcePawnEngine2* spengine2 = nullptr;
++
+   {
+-    // Try to enable line debugging support in the VM until https://github.com/alliedmodders/sourcemod/pull/2240 is merged.
+-    // This is a hack to get the SourcePawn VM factory function.
++    // Grab the SourcePawn VM environment via the factory function. We use it for
++    // two things: enabling line-debugging (EnableDebugBreak -- only safe non-late,
++    // before plugins load) and capturing the v2 engine (spengine2), which the
++    // "All plugins" profiler uses (SetProfilingTool + EnableProfiling).
+     // https://github.com/Garey27/sm-debugger/blob/3c01bf6cede2bb7ddeffb24d0f35d87c4538e039/src/extension.cpp#L127
+     char file[PLATFORM_MAX_PATH];
+     smutils->BuildPath(Path_SM, file, sizeof(file), "bin/" PLATFORM_ARCH_FOLDER SOURCEPAWN_DLL ".%s", PLATFORM_LIB_EXT);
++    if (g_DebugLogging)
++      smutils->LogMessage(myself, "[debug-init] opening VM library: %s", file);
+     auto module = ke::SharedLib::Open(file);
+-    if (module != nullptr)
+-    {
++    if (module == nullptr) {
++      smutils->LogMessage(myself, "[debug-init] FAILED: could not open VM library at %s", file);
++    } else {
+       GetSourcePawnFactoryFn factoryFn = module->get<decltype(factoryFn)>("GetSourcePawnFactory");
+-      if (factoryFn)
+-      {
++      if (!factoryFn) {
++        smutils->LogMessage(myself, "[debug-init] FAILED: GetSourcePawnFactory symbol not found");
++      } else {
+         const int LOWEST_SOURCEPAWN_API_VERSION = 0x0207;
+         ISourcePawnFactory *factory = factoryFn(LOWEST_SOURCEPAWN_API_VERSION);
+-        if (factory)
+-        {
++        if (!factory) {
++          smutils->LogMessage(myself, "[debug-init] FAILED: factory(0x%x) returned null (VM API too old?)", LOWEST_SOURCEPAWN_API_VERSION);
++        } else {
+           ISourcePawnEnvironment *current_env = factory->CurrentEnvironment();
+-          if (current_env)
+-          {
+-            current_env->EnableDebugBreak();
++          if (!current_env) {
++            smutils->LogMessage(myself, "[debug-init] FAILED: CurrentEnvironment() null");
++          } else {
++            spengine2 = current_env->APIv2();
++            if (g_DebugLogging)
++              smutils->LogMessage(myself, "[debug-init] env=%p apiVersion=%d APIv2()=%p",
++                                  (void*)current_env, current_env->ApiVersion(), (void*)spengine2);
++            // Line debugging may only be (re)enabled when loaded non-late, or
++            // already-loaded plugins won't be debuggable. See the deploy note.
++            if (!late)
++              current_env->EnableDebugBreak();
+           }
+         }
+       }
+@@ -110,26 +164,71 @@ ConsoleDebugger::SDK_OnLoad(char *error, size_t maxlength, bool late)
+ 
+   plsys->AddPluginsListener(this);
+ 
++  // On a late load (`sm exts load`/reload after boot) the plugins are already
++  // loaded, so the listener above won't replay OnPluginLoaded for them and the
++  // debugger map would stay empty -- none of the running plugins could be
++  // debugged until individually reloaded. Seed the map for every already-
++  // running plugin so a reloaded extension can debug them right away. (Reaching
++  // here on a late load means debug-break was enabled at the original boot and
++  // persisted, since otherwise SetDebugBreakHandler above would have failed.)
++  // On a normal non-late boot the plugin list is empty here, so this is a
++  // no-op and the listener handles each plugin as it loads.
++  if (late) {
++    IPluginIterator *pliter = plsys->GetPluginIterator();
++    while (pliter->MorePlugins()) {
++      IPlugin *pl = pliter->GetPlugin();
++      if (pl->GetStatus() == PluginStatus::Plugin_Running &&
++          !debugger_map_.find(pl->GetBaseContext()).found())
++        OnPluginLoaded(pl);
++      pliter->NextPlugin();
++    }
++    delete pliter;
++  }
++
+   rootconsole->AddRootConsoleCommand3("debug", "Debug Plugins", this);
+ 
++  // Hand off to the DAP crate: it starts the TCP/DAP server and the profilers.
++  // Everything VS-Code-specific lives behind dap/dap-seam.h.
++  dap::Init(this, spengine2);
++
+   return true;
+ }
+ 
+ void
+ ConsoleDebugger::SDK_OnUnload()
+ {
++  // CRITICAL: detach the debug-break handler FIRST, before anything in this
++  // module is freed. EnableDebugBreak() flips a process-global flag in the VM
++  // that PERSISTS across extension unload/reload (there is no disable, and it
++  // only takes effect before plugins load). The VM keeps calling our
++  // OnDebugBreak on every break opcode; once this .so is unloaded that pointer
++  // dangles into freed memory and the next line any debugged plugin executes
++  // crashes the server. The only way to detach is to null the handler.
++  // InvokeDebugger() null-checks it (vm/debugging.cpp), so this is safe and is
++  // what makes `sm exts unload`/reload survivable.
++  if (smutils->GetScriptingEngine())
++    smutils->GetScriptingEngine()->SetDebugBreakHandler(nullptr);
++
++  // Tear down the DAP crate: stops the TCP server and destroys the profilers.
++  dap::Shutdown();
++
+   plsys->RemovePluginsListener(this);
+   rootconsole->RemoveRootConsoleCommand("debug", this);
+ 
+-  IPluginIterator *pliter = plsys->GetPluginIterator();
+-  while (pliter->MorePlugins())
+-  {
+-    IPlugin *pl = pliter->GetPlugin();
+-    if (pl->GetStatus() == PluginStatus::Plugin_Running)
+-      OnPluginUnloaded(pl);
+-    pliter->NextPlugin();
++  // Tear down every per-plugin Debugger. The map lives on the global
++  // g_Debugger, so any heap Debugger we don't free here leaks on every reload.
++  // An active session must clear its installed breakpoints/watches before we
++  // free it (Deactivate also resumes execution). We drain the whole map -- not
++  // just Plugin_Running entries -- so nothing is left behind.
++  for (DebuggerMap::iterator it = debugger_map_.iter(); !it.empty(); it.next()) {
++    Debugger* debugger = it->value;
++    if (!debugger)
++      continue;
++    if (debugger->active())
++      debugger->Deactivate();
++    delete debugger;
+   }
+-  delete pliter;
++  debugger_map_.clear();
+ }
+ 
+ void
+@@ -153,11 +252,19 @@ ConsoleDebugger::OnPluginLoaded(IPlugin *plugin)
+     debugger->Activate();
+     debugger->SetRunmode(STEPPING);
+   }
++
++  // If a client was debugging a plugin with this filename before a reload
++  // (`sm plugins refresh`), reattach the session to this new instance.
++  dap::OnPluginLoaded(plugin);
+ }
+ 
+ void
+ ConsoleDebugger::OnPluginUnloaded(IPlugin *plugin)
+ {
++  // A reload frees this IPlugin/context; drop any client's now-dangling pointer
++  // to it first (the filename + breakpoint cache are kept for rebind on load).
++  dap::OnPluginUnloaded(plugin);
++
+   // Cleanup after the plugin.
+   DebuggerMap::Result r = debugger_map_.find(plugin->GetBaseContext());
+   if (!r.found())
+@@ -389,6 +496,12 @@ OnDebugBreak(IPluginContext *ctx, sp_debug_break_info_t& dbginfo, const SourcePa
+     return;
+   }
+ 
++  // Sampling profiler: feed the call-stack sampler on every break for the
++  // plugin being profiled. Cheap pointer test + no-op when not profiling, and
++  // runs even if no debug session is active for this plugin (profiling never
++  // pauses).
++  dap::OnDebugBreakSample(ctx, dbginfo);
++
+   // Try to get the debugger instance for this plugin.
+   Debugger *debugger = g_Debugger.GetPluginDebugger(ctx);
+   if (!debugger)
+@@ -403,10 +516,27 @@ OnDebugBreak(IPluginContext *ctx, sp_debug_break_info_t& dbginfo, const SourcePa
+ 
+   // Was there an exception instead of a dbreak instruction?
+   if (report) {
+-    if (report->IsFatal())
+-      printf("STOP on FATAL exception: %s\n", report->Message());
+-    else
+-      printf("STOP on exception: %s\n", report->Message());
++    // Record it so the stop is reported to VS Code with reason "exception" and
++    // the message, and echo it to the Debug Console as an error line. The
++    // normal stop flow below (line/file/function lookup + HandleInput) then
++    // pauses so the user sees the offending line and the full call stack.
++    const char *msg = report->Message() ? report->Message() : "unknown error";
++    debugger->SetException(msg, report->IsFatal());
++
++    char line[512];
++    snprintf(line, sizeof(line), "%s: %s\n",
++             report->IsFatal() ? "Fatal exception" : "Exception", msg);
++    dap::SendOutput(line, "stderr");
++
++    if (g_DebugLogging)
++      printf("STOP on %s exception: %s\n", report->IsFatal() ? "FATAL" : "", msg);
++
++    // Mark the debugger paused so the stop is inspectable. The stackTrace /
++    // scopes / variables / evaluate handlers all gate on IsPaused() (runmode in
++    // {STEPPING,STEPOVER,STEPOUT}); without this the exception stop reports
++    // "paused on exception" but the call stack comes back empty and the editor
++    // never navigates to the offending line. Continue/step later overrides this.
++    debugger->SetRunmode(Runmode::STEPPING);
+   }
+   else {
+     // When running until the function returns, 
+@@ -426,9 +556,17 @@ OnDebugBreak(IPluginContext *ctx, sp_debug_break_info_t& dbginfo, const SourcePa
+     if (debugger->runmode() != Runmode::STEPPING &&
+       debugger->runmode() != Runmode::STEPOVER)
+     {
+-      // Check breakpoint address
+-      isBreakpoint = debugger->breakpoints().CheckBreakpoint(dbginfo.cip);
+-      // Continue execution normally.
++      // Check breakpoint address (evaluates condition / hit count if set).
++      // A logpoint fills log_message and returns false: we log and keep running
++      // (no server freeze).
++      std::string log_message;
++      isBreakpoint = debugger->breakpoints().CheckBreakpoint(dbginfo.cip, dbginfo.frm, debugger, &log_message);
++
++      if (!log_message.empty()) {
++        dap::SendOutput((log_message + "\n").c_str(), "console");
++      }
++
++      // Continue execution normally (also the logpoint path).
+       if (!isBreakpoint)
+         return;
+ 
+@@ -473,6 +611,10 @@ OnDebugBreak(IPluginContext *ctx, sp_debug_break_info_t& dbginfo, const SourcePa
+   // Start the debugger shell and wait for commands.
+   debugger->HandleInput(dbginfo.cip, dbginfo.frm, isBreakpoint);
+ 
++  // The exception (if any) has now been reported to the client; don't let it
++  // leak into the next, unrelated stop.
++  debugger->ClearException();
++
+   // Enable the watchdog timer again if it was enabled before.
+   ResetEngineWatchdog(oldtimeout);
+ 
+diff --git a/extension.h b/extension.h
+index 85f4d0e..c9ebfce 100644
+--- a/extension.h
++++ b/extension.h
+@@ -43,6 +43,12 @@
+ class Debugger;
+ typedef ke::HashMap<IPluginContext *, Debugger *, ke::PointerPolicy<IPluginContext>> DebuggerMap;
+ 
++// Verbose per-message diagnostics are gated behind this runtime flag (set from
++// the cfg "debug_log" key, default off). Use SPDBG_LOG(...) for [SM] DAP-style
++// printf diagnostics; errors and one-time banners should print unconditionally.
++extern bool g_DebugLogging;
++#define SPDBG_LOG(...) do { if (g_DebugLogging) rootconsole->ConsolePrint(__VA_ARGS__); } while (0)
++
+ /**
+  * @brief Sample implementation of the SDK Extension.
+  * Note: Uncomment one of the pre-defined virtual functions in order to use it.
+@@ -129,10 +135,11 @@ public:
+ 
+ public:
+   Debugger *GetPluginDebugger(IPluginContext *ctx);
+-
+-private:
+-  IPlugin * FindPluginByConsoleArg(const char *arg);
++  IPlugin *FindPluginByConsoleArg(const char *arg);
+   bool StartPluginDebugging(IPluginContext *ctx);
++  // Exposed so the DAP crate (dap/) can iterate per-plugin debuggers without
++  // owning the map. The DAP layer is wired in purely through dap/dap-seam.h.
++  DebuggerMap& GetDebuggerMap() { return debugger_map_; }
+ 
+ private:
+   bool debug_next_plugin_ = false;
+diff --git a/frame-utils.h b/frame-utils.h
+new file mode 100644
+index 0000000..eace8f4
+--- /dev/null
++++ b/frame-utils.h
+@@ -0,0 +1,67 @@
++/**
++* vim: set ts=4 :
++* =============================================================================
++* SourceMod Console Debugger Extension
++* Copyright (C) 2018-2021 Peace-Maker  All rights reserved.
++* =============================================================================
++*
++* Shared helpers to reach into VM internals that are not (yet) exposed to
++* extensions. Originally these lived inline in commands.cpp; they are factored
++* out here so both the console-mode `frame` command and the DAP handlers can
++* reuse the exact same (necessarily fragile) logic from a single place.
++*
++* WARNING: The layout assumptions below depend on the SourcePawn VM version
++* (the peace-maker/sourcepawn:debug_api_symbols fork). If frame selection
++* breaks after a VM update, this is the single file to adjust.
++*/
++#ifndef _INCLUDE_DEBUGGER_FRAME_UTILS_H
++#define _INCLUDE_DEBUGGER_FRAME_UTILS_H
++
++#include <sp_vm_api.h>
++#include <memory>
++#include <cstdint>
++
++namespace sp {
++
++// Hack to access data in the VM currently not exposed to extensions.
++// Highly depends on the VM version.
++// TODO: Find a way to safely expose this "implementation detail".
++class InlineFrameIterator
++{
++public:
++  virtual ~InlineFrameIterator()
++  {}
++
++  // "done" should return true if, after the current frame, there are no more
++  // frames to iterate.
++  virtual bool done() const = 0;
++  virtual void next() = 0;
++  virtual int type() const = 0;
++  virtual cell_t function_cip() const = 0;
++  virtual cell_t cip() const = 0;
++  virtual uint32_t native_index() const = 0;
++};
++
++class FrameIteratorHack
++{
++public:
++  virtual void somefunc() = 0;
++  void* ivk_;
++  void* runtime_;
++  intptr_t* next_exit_fp_;
++  std::unique_ptr<InlineFrameIterator> frame_cursor_;
++};
++
++// Read the current (top) frame pointer of a plugin context by reaching into
++// the BaseContext layout. Mirrors the offset math used by the console `frame`
++// command. Kept in one spot so the magic offset is only written once.
++// TODO: Properly expose this from the VM :D
++inline cell_t ReadContextFramePointer(SourcePawn::IPluginContext* ctx)
++{
++  return *(cell_t*)(uintptr_t(ctx) + sizeof(void*) * 10 + sizeof(bool) * 4 +
++                    sizeof(uint32_t) * 2 + sizeof(cell_t) * 3);
++}
++
++} // namespace sp
++
++#endif // _INCLUDE_DEBUGGER_FRAME_UTILS_H
+diff --git a/symbols.cpp b/symbols.cpp
+index 1af30d8..3828151 100644
+--- a/symbols.cpp
++++ b/symbols.cpp
+@@ -157,8 +157,13 @@ SymbolWrapper::DisplayVariable(uint32_t index[], uint32_t idxlevel)
+ {
+   assert(index != nullptr);
+ 
+-  // first check whether the variable is visible at all
+-  if (debugger_->cip() < symbol_->codestart() || debugger_->cip() > symbol_->codeend()) {
++  // first check whether the variable is visible at all -- only for locals and
++  // arguments, since globals/statics have a codestart/codeend set to the
++  // compile range, not the runtime-reachable range (see GetSummaryValue).
++  const SourcePawn::SymbolScope scope = symbol_->scope();
++  if ((scope == SourcePawn::Local || scope == SourcePawn::Argument) &&
++      (debugger_->cip() < symbol_->codestart() ||
++       debugger_->cip() > symbol_->codeend())) {
+     fputs("(not in scope)", stdout);
+     return;
+   }
+@@ -269,35 +274,40 @@ SymbolWrapper::DisplayVariable(uint32_t index[], uint32_t idxlevel)
+ void
+ SymbolWrapper::PrintValue(const SourcePawn::ISymbolType* type, long value)
+ {
++  fputs(FormatScalar(type, static_cast<cell_t>(value)).c_str(), stdout);
++  /*case DISP_HEX:
++    printf("%lx", value);
++    break;*/
++}
++
++std::string
++SymbolWrapper::FormatScalar(const SourcePawn::ISymbolType* type, cell_t value) const
++{
++  char buffer[64];
+   if (type->isFloat32()) {
+-    printf("%f", sp_ctof(value));
++    snprintf(buffer, sizeof(buffer), "%f", sp_ctof(value));
++    return buffer;
+   }
+   else if (type->isBoolean()) {
+-    switch (value)
+-    {
++    switch (value) {
+     case 0:
+-      fputs("false", stdout);
+-      break;
++      return "false";
+     case 1:
+-      fputs("true", stdout);
+-      break;
++      return "true";
+     default:
+-      printf("%ld (false)", value);
+-      break;
++      snprintf(buffer, sizeof(buffer), "%ld (false)", (long)value);
++      return buffer;
+     }
+   }
+   else if (type->isString()) {
+     if (value < 0x20 || value >= 0x7f)
+-      printf("'\\x%02lx'", value);
++      snprintf(buffer, sizeof(buffer), "'\\x%02lx'", (long)value);
+     else
+-      printf("'%c'", (char)value);
++      snprintf(buffer, sizeof(buffer), "'%c'", (char)value);
++    return buffer;
+   }
+-  else {
+-    printf("%ld", value);
+-  }
+-  /*case DISP_HEX:
+-    printf("%lx", value);
+-    break;*/
++  snprintf(buffer, sizeof(buffer), "%ld", (long)value);
++  return buffer;
+ }
+ 
+ const char *
+@@ -311,7 +321,7 @@ SymbolWrapper::ScopeToString()
+ }
+ 
+ bool
+-SymbolWrapper::GetSymbolValue(uint32_t index, cell_t* value)
++SymbolWrapper::GetSymbolValue(uint32_t index, cell_t* value) const
+ {
+   // Tried to index a non-array.
+   if (index > 0 && !symbol_->type()->isArray())
+@@ -372,7 +382,7 @@ SymbolWrapper::SetSymbolValue(uint32_t index, cell_t value)
+ }
+ 
+ const char*
+-SymbolWrapper::GetSymbolString()
++SymbolWrapper::GetSymbolString() const
+ {
+   // Make sure we're dealing with a one-dimensional array.
+   if (!symbol_->type()->isArray() || symbol_->type()->dimcount() != 1)
+@@ -403,17 +413,21 @@ SymbolWrapper::SetSymbolString(const char* value)
+ }
+ 
+ bool
+-SymbolWrapper::GetEffectiveSymbolAddress(cell_t *address)
++sp::ResolveSymbolAddress(Debugger *debugger, const SourcePawn::IDebugSymbol *symbol,
++                         cell_t *address)
+ {
+-  cell_t base = symbol_->address();
++  if (!debugger || !symbol || !symbol->type() || !address)
++    return false;
++
++  cell_t base = symbol->address();
+   // addresses of local vars are relative to the frame
+-  if (symbol_->scope() == SourcePawn::Local || symbol_->scope() == SourcePawn::Argument)
+-    base += debugger_->frm();
++  if (symbol->scope() == SourcePawn::Local || symbol->scope() == SourcePawn::Argument)
++    base += debugger->frm();
+ 
+   // a reference. arrays are always passed by reference.
+   cell_t *addr;
+-  if (symbol_->type()->isReference() || (symbol_->type()->isArray() && debugger_->ctx()->GetRuntime()->UsesDirectArrays() && (symbol_->scope() == SourcePawn::Argument || symbol_->scope() == SourcePawn::Local))) {
+-    if (debugger_->ctx()->LocalToPhysAddr(base, &addr) != SP_ERROR_NONE)
++  if (symbol->type()->isReference() || (symbol->type()->isArray() && debugger->ctx()->GetRuntime()->UsesDirectArrays() && (symbol->scope() == SourcePawn::Argument || symbol->scope() == SourcePawn::Local))) {
++    if (debugger->ctx()->LocalToPhysAddr(base, &addr) != SP_ERROR_NONE)
+       return false;
+ 
+     assert(addr != nullptr);
+@@ -424,6 +438,12 @@ SymbolWrapper::GetEffectiveSymbolAddress(cell_t *address)
+   return true;
+ }
+ 
++bool
++SymbolWrapper::GetEffectiveSymbolAddress(cell_t *address) const
++{
++  return sp::ResolveSymbolAddress(debugger_, symbol_, address);
++}
++
+ SymbolWrapper::operator std::string() const
+ {
+   return renderType(symbol_->type(), symbol_->name() ? symbol_->name() : "");
+diff --git a/symbols.h b/symbols.h
+index 8a0703e..225175e 100644
+--- a/symbols.h
++++ b/symbols.h
+@@ -35,26 +35,54 @@
+ #include "amtl/am-hashmap.h"
+ #include <memory>
+ #include <string>
++#include <vector>
+ 
+ class Debugger;
+ 
++namespace sp {
++
++// THE address computation for a debug symbol, in one place: locals and
++// arguments are frame-relative, and references (plus arrays passed by
++// reference, which is how direct-array runtimes hand them over) hold a pointer
++// that has to be dereferenced once before the storage is reached.
++//
++// Every reader and writer must go through here. Partial re-implementations that
++// applied `+frm` but skipped the dereference are why editing a by-reference
++// argument used to overwrite the reference cell instead of the value, and why
++// breakpoint conditions on such an argument compared an address.
++//
++// Returns false when the symbol has no readable address in the current frame.
++bool ResolveSymbolAddress(Debugger* debugger, const SourcePawn::IDebugSymbol* symbol,
++                          cell_t* address);
++
++} // namespace sp
++
+ class SymbolWrapper {
+ public:
+   SymbolWrapper(Debugger* debugger, const SourcePawn::IDebugSymbol* symbol) : debugger_(debugger), symbol_(symbol) {}
+   void DisplayVariable(uint32_t index[], uint32_t idxlevel);
+   void PrintValue(const SourcePawn::ISymbolType* type, long value);
+   const char *ScopeToString();
+-  bool GetSymbolValue(uint32_t index, cell_t* value);
++  bool GetSymbolValue(uint32_t index, cell_t* value) const;
+   bool SetSymbolValue(uint32_t index, cell_t value);
+-  const char* GetSymbolString();
++  const char* GetSymbolString() const;
+   bool SetSymbolString(const char* value);
+-  bool GetEffectiveSymbolAddress(cell_t *address);
++  bool GetEffectiveSymbolAddress(cell_t *address) const;
+   const SourcePawn::IDebugSymbol* symbol() const {
+     return symbol_;
+   }
++  // Exposed for the DAP variables-view renderer (dap/symbol-render.cpp), which
++  // reads the debugger's current cip/frm for the in-scope check.
++  Debugger* debugger() const {
++    return debugger_;
++  }
+   operator std::string() const;
+   std::string renderType(const SourcePawn::ISymbolType* type, const std::string& name) const;
+ 
++  // Format a single scalar cell according to its type (float/bool/char/int).
++  // Used by the console value printer (PrintValue) and the DAP renderer.
++  std::string FormatScalar(const SourcePawn::ISymbolType* type, cell_t value) const;
++
+ private:
+   Debugger* debugger_;
+   const SourcePawn::IDebugSymbol* symbol_;
+@@ -72,6 +100,7 @@ public:
+   bool ClearWatch(uint32_t num);
+   void ClearAllWatches();
+   void ListWatches();
++  size_t GetWatchCount() const { return watch_table_.elements(); }
+ 
+ private:
+   struct WatchTablePolicy {
+diff --git a/tests/pty_run.py b/tests/pty_run.py
+new file mode 100755
+index 0000000..12a4b36
+--- /dev/null
++++ b/tests/pty_run.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++"""Run a command on a pty, feed it this script's stdin, echo what it printed.
++
++The debugger only opens its interactive `dbg>` prompt when stdin is a terminal:
++on a headless server with a piped stdin it resumes execution instead (otherwise
++`std::getline(std::cin)` on a non-tty would freeze the game server -- see
++Debugger::HandleInput). The console regression suite therefore cannot drive
++srcds through a plain heredoc; it needs a pty in between, which is all this
++does.
++
++Stopping is marker-driven rather than EOF-driven: srcds has no "quit on EOF"
++once it is talking to a terminal, so waiting for it to exit would mean waiting
++out a timeout on every run. --until is the last line the suite cares about;
++once it shows up (plus a short drain for whatever trails it) the child is
++killed and its output printed.
++
++Usage: pty_run.py [--until MARKER] [--timeout SECONDS] -- <command> [args...]
++"""
++import argparse
++import os
++import pty
++import select
++import subprocess
++import sys
++import time
++
++parser = argparse.ArgumentParser()
++parser.add_argument('--until', dest='marker', default=None,
++                    help='stop once this text has been printed')
++parser.add_argument('--timeout', type=float, default=180.0,
++                    help='give up after this many seconds (default: 180)')
++parser.add_argument('command', nargs=argparse.REMAINDER)
++args = parser.parse_args()
++
++command = args.command[1:] if args.command[:1] == ['--'] else args.command
++if not command:
++    parser.error('no command given')
++
++commands = sys.stdin.buffer.read()
++marker = args.marker.encode() if args.marker else None
++
++master, slave = pty.openpty()
++proc = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave, close_fds=True)
++os.close(slave)
++os.write(master, commands)
++
++output = bytearray()
++deadline = time.monotonic() + args.timeout
++seen_marker = False
++while time.monotonic() < deadline:
++    readable, _, _ = select.select([master], [], [], 0.25)
++    if readable:
++        try:
++            chunk = os.read(master, 65536)
++        except OSError:  # the child closed the pty
++            break
++        if not chunk:
++            break
++        output += chunk
++        if marker and not seen_marker and marker in output:
++            # Drain briefly so the marker's own line (and anything the server
++            # prints right behind it) lands in the captured output too.
++            seen_marker = True
++            deadline = time.monotonic() + 1.0
++    elif proc.poll() is not None:
++        break
++
++os.close(master)
++if proc.poll() is None:
++    proc.kill()
++proc.wait()
++
++# The pty turns every "\n" into "\r\n"; undo that so the captured text can be
++# compared against the plain golden files.
++sys.stdout.buffer.write(bytes(output).replace(b'\r\n', b'\n'))
++sys.exit(0 if (marker is None or seen_marker) else 1)
+diff --git a/tests/run_tests.sh b/tests/run_tests.sh
+index af53d28..3cc535c 100755
+--- a/tests/run_tests.sh
++++ b/tests/run_tests.sh
+@@ -7,19 +7,34 @@ cwd=$(dirname $(readlink -f "$0"))
+ 
+ # $cwd/mock/gamedir/addons/sourcemod/scripting/spcomp ./debugger_test.sp -odebugger_test_latest.smx
+ 
+-cd ..
++# The extension now builds from the repo root (the upstream sources under
++# sp-console-debugger/ are compiled together with the dap/ crate into one
++# .ext.so), so build two levels up instead of one. Anchor it on the script's own
++# location so the suite can be started from any directory.
++cd "$cwd/../.."
+ python3 configure.py --sm-path "$cwd/mock/sourcemod" --targets x86,x86_64
++# configure.py exits 0 even when configuration fails; .ambuild2/vars is the
++# generator's success marker, so fail here rather than inside ambuild.
++test -f objdir/.ambuild2/vars \
++    || { echo "::error::configure failed (see output above)" >&2; exit 1; }
+ ambuild objdir
+ 
+ cd "$cwd/mock/hl2sdk-mock"
+-bash build_gamedir.sh "$cwd/mock/gamedir" "$cwd/../objdir/package"
++bash build_gamedir.sh "$cwd/mock/gamedir" "$cwd/../../objdir/package"
+ 
+ function test_output {
+     cd "$cwd/mock/hl2sdk-mock"
+     local pluginname="$1"
+     local linenumber="$2"
+     ln -sf "$cwd/$pluginname.smx" "$cwd/mock/gamedir/addons/sourcemod/plugins/$pluginname.smx"
+-    local output=$(./objdir/dist/x86_64/srcds -game_dir "$cwd/mock/gamedir" +map de_thunder -run-ticks 20 <<- EOF
++    # srcds has to run on a pty: the debugger only opens its interactive "dbg>"
++    # prompt when stdin is a terminal -- a piped stdin means "headless server",
++    # where it resumes instead of freezing (Debugger::HandleInput). Fed through a
++    # plain heredoc the plugin would just run past the breakpoint. pty_run.py
++    # provides the terminal and forwards these commands into it.
++    local output
++    output=$(python3 "$cwd/pty_run.py" --until '---- STOP DEBUG ----' -- \
++        ./objdir/dist/x86_64/srcds -game_dir "$cwd/mock/gamedir" +map de_thunder -run-ticks 20 <<- EOF
+ sm debug start $pluginname.smx
+ sm debug bp $pluginname.smx add $linenumber
+ bp
+@@ -28,7 +43,12 @@ print *
+ quit
+ quit
+ EOF
+-)
++) || {
++        echo "$output"
++        rm -f "$cwd/mock/gamedir/addons/sourcemod/plugins/$pluginname.smx"
++        echo "$pluginname: srcds never reached '---- STOP DEBUG ----'"
++        exit 1
++    }
+     cd ../..
+ 
+     debug_output=$(sed -n '/START DEBUG/,/STOP DEBUG/p' <<< "$output")
+diff --git a/tests/setup.sh b/tests/setup.sh
+index b9bf3f1..6014a0e 100755
+--- a/tests/setup.sh
++++ b/tests/setup.sh
+@@ -1,49 +1,97 @@
+ #!/bin/bash
++# Builds the mock environment the regression suites run against: hl2sdk-mock
++# (fake engine + srcds), Metamod:Source, and SourceMod compiled against the
++# PATCHED SourcePawn VM (peace-maker's debug_api_symbols branch) that exports
++# the debug symbol API this debugger needs.
++#
++# Every tree is pinned to a commit. The patched VM forked from SourcePawn in
++# Nov 2024 and has not tracked upstream since, while SourceMod master has:
++# "Statically link SourcePawn" (#2459, 2026-05-14) made core/logic/AMBuilder
++# call SP.AddVmFlags(), which the fork does not define, and master's core also
++# uses VM APIs added after the fork (IPluginContext::LocalToArrayPtr /
++# GetArrayData). Tracking master therefore cannot build here, so the mock env
++# follows the SourceMod 1.12 stable line -- contemporaneous with the fork, and
++# the line the extension's ext-API-8 code path targets.
++#
++# Bumping: move a pin, run this script, run ./run_tests.sh and
++# ../../vscode/tests/dap/run_dap_tests.sh. See docs/updating-upstream.md.
++set -euo pipefail
+ 
+-cwd=$(dirname $(readlink -f $0))
++HL2SDK_MOCK_COMMIT=61c67bcf25f93fce824193d087109494ae6856a6  # master,   2026-07-05
++METAMOD_COMMIT=2667e8e5947237c4cb7ea45cec3913ad6a44757c      # master,   2026-07-22
++SOURCEMOD_COMMIT=e5de0a0cdef3eb2bc484b17ce63a4e14fcf3f221    # 1.12-dev, 2026-07-22
++SOURCEPAWN_COMMIT=08b7f7213c5a645eff72cd1efd4c24d330b1e0ee   # peace-maker, debug_api_symbols, 2025-01-09
++
++cwd=$(dirname "$(readlink -f "$0")")
+ mkdir -p "$cwd/mock"
+-cd mock
++cd "$cwd/mock"
+ 
++# Clone (or reuse an already-cloned/CI-cached tree) and park it on $commit. The
++# checkout is detached and forced so a restored cache cannot drift: whatever it
++# holds, the pin above decides what gets built.
+ function checkout() {
+     local name=$1
+     local repo=$2
+-    local branch=$3
+-    if [ ! -d "$name" ]; then
+-        git clone --recursive $repo -b $branch $name
+-    else
+-        cd $name
+-        git checkout $branch
+-        git pull origin $branch
+-        cd ..
++    local commit=$3
++    if [ ! -d "$name/.git" ]; then
++        rm -rf "$name"   # a half-restored cache would make `git clone` refuse
++        git clone --quiet "$repo" "$name"
+     fi
++    git -C "$name" cat-file -e "$commit^{commit}" 2>/dev/null || git -C "$name" fetch --quiet origin
++    git -C "$name" checkout --quiet --force --detach "$commit"
++    git -C "$name" submodule update --init --recursive --quiet
+ }
+ 
+-checkout "hl2sdk-mock" "https://github.com/alliedmodders/hl2sdk-mock" "master"
+-checkout "sourcemod" "https://github.com/alliedmodders/sourcemod" "master"
+-checkout "metamod-source" "https://github.com/alliedmodders/metamod-source" "master"
+-pip install --upgrade git+https://github.com/alliedmodders/ambuild.git
++checkout "hl2sdk-mock" "https://github.com/alliedmodders/hl2sdk-mock" "$HL2SDK_MOCK_COMMIT"
++checkout "sourcemod" "https://github.com/alliedmodders/sourcemod" "$SOURCEMOD_COMMIT"
++checkout "metamod-source" "https://github.com/alliedmodders/metamod-source" "$METAMOD_COMMIT"
+ 
+-cd sourcemod/sourcepawn
+-git remote add peace https://github.com/peace-maker/sourcepawn
+-git fetch peace
+-git checkout debug_api_symbols
+-git pull peace debug_api_symbols
+-cd ../..
++# Swap SourceMod's SourcePawn submodule for the patched VM. This has to run
++# AFTER the submodule update above, which would otherwise drag it back to the
++# stock upstream commit.
++sp="sourcemod/sourcepawn"
++git -C "$sp" remote get-url peace >/dev/null 2>&1 \
++    || git -C "$sp" remote add peace https://github.com/peace-maker/sourcepawn
++git -C "$sp" cat-file -e "$SOURCEPAWN_COMMIT^{commit}" 2>/dev/null \
++    || git -C "$sp" fetch --quiet peace debug_api_symbols
++git -C "$sp" checkout --quiet --force --detach "$SOURCEPAWN_COMMIT"
++git -C "$sp" submodule update --init --recursive --quiet
+ 
+-cd hl2sdk-mock
+-python3 configure.py --targets=x86,x86_64
+-ambuild objdir
++# Only bootstrap AMBuild when it is actually missing, so an existing install
++# (a virtualenv, say) is left alone and `pip install` cannot abort the script on
++# distros whose system python is externally managed.
++python3 -c 'import ambuild2' 2>/dev/null \
++    || pip install --upgrade git+https://github.com/alliedmodders/ambuild.git
+ 
+-cd ../metamod-source
+-python3 configure.py --sdks=mock --targets=x86,x86_64
+-ambuild objdir
++# configure.py exits 0 even when configuration FAILS -- it only prints
++# "Configure failed: ...". That is how a broken tree used to sail past this step
++# and blow up later somewhere unrelated. The generator writes .ambuild2/vars on
++# success, so use it as the verdict and stop here instead.
++function configure_and_build() {
++    local dir=$1
++    shift
++    (
++        cd "$dir"
++        python3 configure.py "$@"
++        test -f objdir/.ambuild2/vars \
++            || { echo "::error::configure failed in $dir (see output above)" >&2; exit 1; }
++        ambuild objdir
++    )
++}
+ 
+-cd ../sourcemod
+-python3 configure.py --sdks=mock --targets=x86,x86_64 --no-mysql
+-ambuild objdir
++configure_and_build "hl2sdk-mock" --targets=x86,x86_64
++configure_and_build "metamod-source" --sdks=mock --targets=x86,x86_64
++configure_and_build "sourcemod" --sdks=mock --targets=x86,x86_64 --no-mysql
+ 
+-cd ../hl2sdk-mock
++cd hl2sdk-mock
+ mkdir -p "$cwd/mock/gamedir"
+ bash build_gamedir.sh "$cwd/mock/gamedir" "$cwd/mock/metamod-source/objdir/package"
+ bash build_gamedir.sh "$cwd/mock/gamedir" "$cwd/mock/sourcemod/objdir/package"
+-mv $cwd/mock/gamedir/addons/sourcemod/plugins/*.smx $cwd/mock/gamedir/addons/sourcemod/plugins/disabled/
++
++# Park the stock plugins in disabled/ -- the tests enable exactly the one they
++# need. Tolerate an already-staged gamedir (nothing left to move on a re-run).
++shopt -s nullglob
++stock=("$cwd"/mock/gamedir/addons/sourcemod/plugins/*.smx)
++if [ ${#stock[@]} -gt 0 ]; then
++    mv "${stock[@]}" "$cwd/mock/gamedir/addons/sourcemod/plugins/disabled/"
++fi

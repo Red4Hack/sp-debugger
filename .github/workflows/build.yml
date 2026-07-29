@@ -1,0 +1,266 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*" # e.g. v1.0.4 -> builds everything and cuts a release
+  schedule:
+    - cron: "30 03 01 */3 *" # Artifacts expire every 3 months
+
+permissions:
+  contents: write # needed by the release job to create/upload a GitHub release
+
+jobs:
+  build:
+    name: build (${{ matrix.os }} / ${{ matrix.sm.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - windows-latest
+        # Build against BOTH SourceMod lines. The extension API version is baked
+        # in from the SDK headers at compile time: master (1.13-dev) is ext API 9,
+        # which stable 1.12 servers refuse with "Extension version is too new to
+        # load (9, max is 8)". Shipping one package per line lets server owners
+        # pick the one matching their SourceMod install.
+        # (Bump branch/label here when a new SourceMod stable rolls.)
+        sm:
+          - { branch: "1.12-dev", label: "sm1.12" } # stable (ext API 8)
+          - { branch: "master", label: "sm1.13" }   # dev    (ext API 9)
+
+    steps:
+      - name: Prepare env
+        shell: bash
+        run: |
+          echo "GITHUB_SHA_SHORT=${GITHUB_SHA::7}" >> $GITHUB_ENV
+
+      # Pin one interpreter for the whole job. setup-python registers it on
+      # GITHUB_PATH, so `python` resolves to the SAME environment in every step
+      # regardless of shell -- critical on Windows, where the default steps use
+      # PowerShell but "Build SourcePawn VM" uses Git Bash, and the two would
+      # otherwise pick different pythons (only one of which has our pip installs).
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-multilib g++-multilib libstdc++6 lib32stdc++6 \
+            libc6-dev libc6-dev-i386 linux-libc-dev \
+            linux-libc-dev:i386 clang
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "CXX=clang++" >> $GITHUB_ENV
+
+      - name: Getting SourceMod (${{ matrix.sm.branch }})
+        uses: actions/checkout@v4
+        with:
+          repository: alliedmodders/sourcemod
+          ref: ${{ matrix.sm.branch }}
+          path: sourcemod
+          submodules: recursive
+
+      - name: Switch to debug symbol sourcepawn branch
+        run: |
+          cd sourcemod/sourcepawn
+          git remote add peace https://github.com/peace-maker/sourcepawn.git
+          git fetch peace
+          git switch debug_api_symbols
+          git submodule update --init --recursive
+
+      - name: Getting ambuild
+        run: |
+          # SourceMod's sourcepawn/configure.py does `from pkg_resources import
+          # parse_version`. pkg_resources lives in setuptools, but setuptools 81+
+          # REMOVED it (verified: 82.0.1 no longer has the module), so we must
+          # pin below 81 -- a plain `--upgrade setuptools` would sail past the
+          # last working version and break configure.py on every OS. Thanks to
+          # the setup-python step above, this lands in the one interpreter every
+          # step (PowerShell and Git Bash alike) resolves to.
+          python -m pip install --upgrade pip wheel
+          python -m pip install "setuptools<81"
+          pip install git+https://github.com/alliedmodders/ambuild
+
+      - name: Getting own repository
+        uses: actions/checkout@v4
+        with:
+          path: sp-debugger
+
+      # The vendored sp-console-debugger/ tree is NOT committed -- reconstruct it
+      # from the pinned upstream commit plus our patch (docs/updating-upstream.md).
+      - name: Fetch vendored sp-console-debugger (upstream + patch)
+        working-directory: sp-debugger
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(cat patches/sp-console-debugger.commit)"
+          test -n "$sha"
+          git init sp-console-debugger
+          git -C sp-console-debugger fetch --depth 1 https://github.com/peace-maker/sp-console-debugger "$sha"
+          git -C sp-console-debugger reset --hard FETCH_HEAD
+          git -C sp-console-debugger apply --whitespace=nowarn ../patches/sp-console-debugger.patch
+
+      - name: Compiling Extension
+        working-directory: sp-debugger
+        run: |
+          python configure.py --enable-optimize --targets x86,x86_64 --sm-path="${{ github.workspace }}/sourcemod"
+          ambuild objdir
+
+      - name: Build SourcePawn VM
+        working-directory: sourcemod/sourcepawn
+        shell: bash
+        run: |
+          python configure.py --enable-optimize --targets x86,x86_64
+          ambuild objdir
+          echo "Built libsourcepawn artifacts:"
+          find objdir -name 'libsourcepawn.*' -print
+
+      # The patched (debug_api_symbols) VM MUST ship with the extension -- the
+      # profiler and symbol-aware debugging depend on it. Locate the built libs
+      # by glob (ambuild's exact subfolder can change) and copy to the names the
+      # extension loads: bin/sourcepawn.jit.x86.{so,dll} and bin/x64/sourcepawn.vm.{so,dll}.
+      # Fail loudly if a lib is missing so we never ship a package without the VM.
+      - name: Package SourcePawn VM (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        working-directory: sourcemod/sourcepawn
+        run: |
+          set -euo pipefail
+          DEST="${{ github.workspace }}/sp-debugger/objdir/package/addons/sourcemod/bin"
+          mkdir -p "$DEST/x64"
+          x86_lib="$(find objdir -path '*-x86/libsourcepawn.so' ! -path '*x86_64*' | head -n1)"
+          x64_lib="$(find objdir -path '*x86_64/libsourcepawn.so' | head -n1)"
+          echo "x86: ${x86_lib:-<none>}"
+          echo "x64: ${x64_lib:-<none>}"
+          [ -n "$x86_lib" ] || { echo "::error::libsourcepawn.so (x86) not found"; exit 1; }
+          [ -n "$x64_lib" ] || { echo "::error::libsourcepawn.so (x86_64) not found"; exit 1; }
+          cp "$x86_lib" "$DEST/sourcepawn.jit.x86.so"
+          cp "$x64_lib" "$DEST/x64/sourcepawn.vm.so"
+          ls -l "$DEST/sourcepawn.jit.x86.so" "$DEST/x64/sourcepawn.vm.so"
+
+      - name: Package SourcePawn VM (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        working-directory: sourcemod/sourcepawn
+        run: |
+          set -euo pipefail
+          DEST="${{ github.workspace }}/sp-debugger/objdir/package/addons/sourcemod/bin"
+          mkdir -p "$DEST/x64"
+          x86_lib="$(find objdir -path '*-x86/libsourcepawn.dll' ! -path '*x86_64*' | head -n1)"
+          x64_lib="$(find objdir -path '*x86_64/libsourcepawn.dll' | head -n1)"
+          echo "x86: ${x86_lib:-<none>}"
+          echo "x64: ${x64_lib:-<none>}"
+          [ -n "$x86_lib" ] || { echo "::error::libsourcepawn.dll (x86) not found"; exit 1; }
+          [ -n "$x64_lib" ] || { echo "::error::libsourcepawn.dll (x86_64) not found"; exit 1; }
+          cp "$x86_lib" "$DEST/sourcepawn.jit.x86.dll"
+          cp "$x64_lib" "$DEST/x64/sourcepawn.vm.dll"
+          ls -l "$DEST/sourcepawn.jit.x86.dll" "$DEST/x64/sourcepawn.vm.dll"
+
+      # Confirm both extension binaries shipped. Fail loudly otherwise so a
+      # packaging regression can't slip an empty build out. (The runtime config
+      # is no longer packaged -- the extension generates it on first load.)
+      - name: Verify package contents
+        shell: bash
+        working-directory: sp-debugger
+        run: |
+          set -euo pipefail
+          for f in objdir/package/addons/sourcemod/extensions/sp-debugger.ext.* \
+                   objdir/package/addons/sourcemod/extensions/x64/sp-debugger.ext.*; do
+            [ -f "$f" ] || { echo "::error::$f missing from package"; exit 1; }
+            echo "ok: $f"
+          done
+
+      # The ONLY artifact per build: the package directory. Release assets are
+      # assembled from these by the release job -- no duplicate "release-server"
+      # artifacts cluttering the run.
+      - name: Uploading package
+        uses: actions/upload-artifact@v4
+        with:
+          name: sp-debugger-${{ matrix.os }}-${{ matrix.sm.label }}-${{ env.GITHUB_SHA_SHORT }}
+          path: sp-debugger/objdir/package
+
+  vsix:
+    name: build (vscode .vsix)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Getting own repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        working-directory: vscode
+        run: bun install --frozen-lockfile
+
+      # On a tag push, stamp the extension version from the tag (v1.2.3 -> 1.2.3)
+      # so the .vsix filename and manifest match the release.
+      - name: Sync version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: vscode
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Setting extension version to $VERSION"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+      # The extension is compiled with tsc (not bundled), so its single runtime
+      # dependency (@vscode/debugadapter) must ship inside the .vsix -- do NOT
+      # pass --no-dependencies here. vsce runs the vscode:prepublish hook
+      # (bun run compile) automatically before packaging.
+      - name: Package .vsix
+        working-directory: vscode
+        run: bunx vsce package -o sp-debugger.vsix
+
+      - name: Upload .vsix artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sp-debugger-vsix
+          path: vscode/sp-debugger.vsix
+
+  release:
+    name: release
+    needs: [build, vsix]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # Each sp-debugger-<os>-<sm>-<sha> artifact downloads as the package
+      # directory; archive each one into a release asset named by platform and
+      # SourceMod line (so server owners grab the one matching their install).
+      - name: Collect release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp -v artifacts/sp-debugger-vsix/*.vsix release/
+          for dir in artifacts/sp-debugger-*/; do
+            name="$(basename "$dir")"
+            [ "$name" = "sp-debugger-vsix" ] && continue
+            label="$(echo "$name" | grep -oE 'sm[0-9]+\.[0-9]+')"
+            case "$name" in
+              *ubuntu*)  tar -czf "release/sp-debugger-server-linux-${label}.tar.gz" -C "$dir" . ;;
+              *windows*) (cd "$dir" && zip -qr "${GITHUB_WORKSPACE}/release/sp-debugger-server-windows-${label}.zip" .) ;;
+              *) echo "::warning::unrecognized artifact $name (skipped)" ;;
+            esac
+          done
+          echo "Release assets:"
+          ls -l release
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
