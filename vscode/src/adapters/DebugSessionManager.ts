@@ -347,10 +347,11 @@ export class DebugSessionManager extends EventEmitter {
    * Forward a custom (non-standard-DAP) request straight to the server and
    * return its response body. Used by the function profiler
    * (sp_profileStart / sp_profileStop), which doesn't depend on the
-   * paused/running state. A generous timeout covers a large call-tree dump.
+   * paused/running state. The default timeout is generous to cover a large
+   * call-tree dump; the 1 Hz performance poll passes a short one.
    */
-  async sendCustomRequest(command: string, args?: any): Promise<any> {
-    return this.connectionManager.sendRequest(command, args ?? {}, 60000);
+  async sendCustomRequest(command: string, args?: any, timeoutMs: number = 60000): Promise<any> {
+    return this.connectionManager.sendRequest(command, args ?? {}, timeoutMs);
   }
 
   /**

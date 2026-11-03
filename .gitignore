@@ -1,9 +1,21 @@
-objdir
-vscode/node_modules
-vscode/out
+# --- Build output ---------------------------------------------------------
+objdir/
+objdir-*/
+dist/
+compile_flags.txt
+
+# --- Tooling / local environment -----------------------------------------
+.venv/
+.pi/
+bkp/
+
+# --- Debugger source (rebuilt from upstream + patches/, see docs) ---------
+sp-console-debugger/
+
+# --- VS Code extension ----------------------------------------------------
+vscode/node_modules/
+vscode/out/
 vscode/*.vsix
-.venv
-.claude
-.ruvector
-bkp
-sp-console-debugger
+
+# --- Compiled test plugins ------------------------------------------------
+*.smx

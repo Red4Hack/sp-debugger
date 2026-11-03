@@ -26,11 +26,13 @@
 #endif
 
 #include "dap-bridge.h"
+#include "vm-hooks.h"
 #include "debugger.h"
 #include "tcp-server.h"
 #include "session-manager.h"
 #include "json-utils.h"
 #include "profiler.h"
+#include "perf-stats.h"
 #include "config.h"
 #include <amtl/am-platform.h>
 
@@ -144,8 +146,8 @@ static void EnsureDefaultConfig()
     smutils->LogMessage(myself, "Wrote default console-debugger.cfg to %s", path);
 }
 
-DapBridge::DapBridge(ConsoleDebugger* ext, SourcePawn::ISourcePawnEngine2* engine2)
-  : ext_(ext), spengine2_(engine2)
+DapBridge::DapBridge(ConsoleDebugger* ext, bool vm_profiling)
+  : ext_(ext), vm_profiling_(vm_profiling)
 {
 }
 
@@ -222,10 +224,10 @@ DapBridge::Start()
   // the idle between server frames; otherwise a top-level forward like
   // OnGameFrame reads ~= the whole capture window instead of its real work.
   traced_profiler_ = std::make_unique<Profiler>(Profiler::Timing::kSelfGap);
-  if (spengine2_)
-    spengine2_->SetProfilingTool(vm_profiler_.get());
+  if (vm_profiling_)
+    spdbg::vm::SetProfilingTool(vm_profiler_.get());
   else
-    smutils->LogMessage(myself, "SourcePawn v2 engine unavailable; 'All plugins' profiler disabled");
+    smutils->LogMessage(myself, "SourcePawn VM profiling hooks unavailable; 'All plugins' profiler disabled");
 }
 
 void
@@ -242,9 +244,9 @@ DapBridge::Shutdown()
   // Stop any in-flight capture and destroy the profilers. Unregister the VM
   // profiling tool first so the VM never calls into a freed object.
   EndSampling();
-  if (spengine2_) {
-    spengine2_->DisableProfiling();
-    spengine2_->SetProfilingTool(nullptr);
+  if (vm_profiling_) {
+    spdbg::vm::DisableProfiling();
+    spdbg::vm::SetProfilingTool(nullptr);
   }
   vm_profiler_.reset();
   traced_profiler_.reset();
@@ -265,7 +267,10 @@ DapBridge::FindPluginByConsoleArg(const char* arg)
 bool
 DapBridge::StartPluginDebugging(IPluginContext* ctx)
 {
-  return ext_->StartPluginDebugging(ctx);
+  const bool ok = ext_->StartPluginDebugging(ctx);
+  if (ok)
+    dap::perf::TrackPlugin(ctx); // (re)starts the peak stack/heap tracking
+  return ok;
 }
 
 DebuggerMap&
@@ -514,18 +519,44 @@ DapBridge::MaybeRecordProfileSample(IPluginContext* ctx, sp_debug_break_info_t& 
 
   // Remember the line executing from here on, for the next gap's attribution.
   last_profile_line_ = 0;
-  if (IPluginDebugInfo* dbg = ctx->GetRuntime()->GetDebugInfo()) {
+  if (SpPluginDebugInfo* dbg = SpDebugInfo(ctx->GetRuntime())) {
     uint32_t line = 0;
     if (dbg->LookupLine(dbginfo.cip, &line) == SP_ERROR_NONE)
       last_profile_line_ = line;
   }
 
+  // SourcePawn 2.0 (SourceMod 1.13) reports frm = 0 on every break, for v2 and
+  // legacy plugins alike. Left as is, the fast path below would see "same frame"
+  // forever and only the first function would ever be recorded. The frame's
+  // register base (unique per live call) stands in for it. Same recovery as
+  // sp::ReadContextFramePointer() in the console debugger.
+  cell_t frm = dbginfo.frm;
+#if defined(SPDBG_MERGED_ENV_API)
+  if (frm == 0) {
+    IPluginRuntime* rt = ctx->GetRuntime();
+    SpPluginDebugInfo* info = SpDebugInfo(rt);
+    if (info && info->IsV2()) {
+      std::vector<cell_t> frames;
+      if (spdbg::vm::InterpreterFrames(rt, false, &frames) && !frames.empty())
+        frm = frames[0];
+    } else if (info) {
+      // Legacy runtime: LocalParams() is frm + 2 cells as a host pointer, and
+      // local address 0 is the plugin's memory base.
+      cell_t* params = spdbg::vm::LocalParams(rt);
+      cell_t* base = nullptr;
+      if (params && ctx->LocalToPhysAddr(0, &base) == SP_ERROR_NONE && base)
+        frm = cell_t(reinterpret_cast<uintptr_t>(params) - reinterpret_cast<uintptr_t>(base)) -
+              cell_t(2 * sizeof(cell_t));
+    }
+  }
+#endif
+
   // Fast path: consecutive lines in the same function share a frame pointer, so
   // no call/return happened -- nothing to reconcile.
-  if (ctx == last_profile_ctx_ && dbginfo.frm == last_profile_frm_)
+  if (ctx == last_profile_ctx_ && frm == last_profile_frm_)
     return;
   last_profile_ctx_ = ctx;
-  last_profile_frm_ = dbginfo.frm;
+  last_profile_frm_ = frm;
 
   // Build the current scripted call path, outermost->innermost, keeping ONLY the
   // target plugin's frames (cross-plugin callers/callees run in other contexts
@@ -691,6 +722,10 @@ DapBridge::OnLastClientDisconnect()
   if (g_DebugLogging)
     std::cout << "[Debugger] Last TCP client disconnected - ending debug sessions" << std::endl;
 
+  // Back to full speed: nobody is debugging any more (no-op unless a v2 plugin
+  // made us switch the JIT off).
+  spdbg::vm::RequireInterpreter(false);
+
   // When the DAP client goes away we must fully END the debug session, not just
   // resume it. Otherwise the breakpoints set by the client stay installed and
   // the next time the plugin runs it hits them with no client attached and
@@ -770,17 +805,19 @@ WaitResult WaitForResume()
 
 namespace dap {
 
-void Init(ConsoleDebugger* ext, SourcePawn::ISourcePawnEngine2* engine2)
+void Init(ConsoleDebugger* ext, bool vm_profiling)
 {
   // Materialise the default config before Start() reads the port, so first-ever
   // boot picks up the freshly-written file instead of logging "not found".
   EnsureDefaultConfig();
-  g_bridge = std::make_unique<DapBridge>(ext, engine2);
+  g_bridge = std::make_unique<DapBridge>(ext, vm_profiling);
   g_bridge->Start();
+  perf::Init();
 }
 
 void Shutdown()
 {
+  perf::Shutdown();
   if (g_bridge) {
     g_bridge->Shutdown();
     g_bridge.reset();
@@ -789,6 +826,7 @@ void Shutdown()
 
 void OnPluginLoaded(IPlugin* plugin)
 {
+  perf::RefreshPluginMemory(); // main thread; keeps the plugin-memory total fresh
   if (g_bridge)
     g_bridge->RebindClientsToReloadedPlugin(plugin);
 }
@@ -801,6 +839,7 @@ void OnPluginUnloaded(IPlugin* plugin)
 
 void OnDebugBreakSample(IPluginContext* ctx, sp_debug_break_info_t& dbginfo)
 {
+  perf::OnBreak(ctx);
   if (g_bridge)
     g_bridge->MaybeRecordProfileSample(ctx, dbginfo);
 }

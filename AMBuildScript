@@ -1,5 +1,5 @@
 # vim: set sts=2 ts=8 sw=2 tw=99 et ft=python:
-import os, sys
+import os, re, sys
 
 def ResolveEnvPath(env, folder):
   if env in os.environ:
@@ -77,6 +77,15 @@ class ExtensionConfig(object):
     if not self.sm_root or not os.path.isdir(self.sm_root):
       raise Exception('Could not find a source copy of SourceMod')
     self.sm_root = Normalize(self.sm_root)
+
+    api = os.path.join(self.sm_root, 'sourcepawn', 'include', 'sp_vm_api.h')
+    with open(api, 'r', encoding='utf-8', errors='replace') as fp:
+      text = fp.read()
+    self.merged_env_api = re.search(
+      r'typedef\s+ISourcePawnEnvironment\s+ISourcePawnEngine\s*;', text) is not None
+    print('SourcePawn VM API: {}'.format(
+      'merged (SourceMod 1.13+ / SourcePawn 2.0)' if self.merged_env_api
+      else 'split (SourceMod 1.12)'))
 
   def configure(self):
     for cxx in self.all_targets:
@@ -256,9 +265,20 @@ class ExtensionConfig(object):
       os.path.join(self.sm_root, 'sourcepawn', 'include'),
       os.path.join(self.sm_root, 'public', 'amtl', 'amtl'),
       os.path.join(self.sm_root, 'public', 'amtl'),
+      # Stock-VM support: our own SMX debug-info parser + VM hooks.
+      os.path.join(context.currentSourcePath, 'stockvm'),
+      # zlib for compressed .smx files -- SourcePawn's bundled copy. Last, so
+      # its generic header names (trees.h, zutil.h) never shadow anything.
+      os.path.join(self.sm_root, 'sourcepawn', 'third_party', 'zlib'),
     ]
     # Mark the build so upstream files can guard the thin seam calls behind it.
     compiler.defines += ['SPDBG_DAP=1']
+    # SourceMod 1.13+ ships SourcePawn 2.0, whose ISourcePawnEngine/Engine2 are
+    # typedefs of one merged ISourcePawnEnvironment without the debug-break or
+    # profiling methods. Detect it from the target's own header so one source
+    # tree builds against the stock SourcePawn of either line.
+    if self.merged_env_api:
+      compiler.defines += ['SPDBG_MERGED_ENV_API=1']
     return compiler
 
   def Library(self, context, compiler, name):

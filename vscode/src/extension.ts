@@ -4,6 +4,7 @@ import { ConfigValidator } from "./utils/ConfigValidator";
 import { Logger } from "./utils/Logger";
 import { FileUtils } from "./utils/FileUtils";
 import { ProfilerTreeProvider } from "./profiler/ProfilerTreeProvider";
+import { PerfViewProvider } from "./perf/PerfViewProvider";
 import { captureToCpuProfile } from "./profiler/cpuprofile";
 import { captureToTrace } from "./profiler/trace";
 import { tmpdir as osTmpDir } from "os";
@@ -49,6 +50,15 @@ export function activate(context: vscode.ExtensionContext) {
       "spDebuggerProfiler",
       profilerProvider,
     ),
+  );
+
+  // --- Realtime Performance ---------------------------------------------
+  // CPU / memory of the game server, polled via `sp_performance` while the
+  // panel is visible. Lives next to the profiler in Run & Debug.
+  const perfProvider = new PerfViewProvider();
+  context.subscriptions.push(
+    perfProvider,
+    vscode.window.registerWebviewViewProvider(PerfViewProvider.viewType, perfProvider),
   );
 
   context.subscriptions.push(
@@ -153,7 +163,7 @@ export function activate(context: vscode.ExtensionContext) {
         const start = await session.customRequest("sp_profileStart");
         if (start && start.active === false) {
           vscode.window.showErrorMessage(
-            "Profiler unavailable on the server (SourcePawn v2 engine not found / patched VM missing).",
+            "Profiler unavailable on the server (the VM profiling hooks were not found; see docs/troubleshooting.md).",
           );
           return;
         }

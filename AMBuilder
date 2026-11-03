@@ -27,13 +27,34 @@ dapFiles = [
   'tcp-server.cpp',
   'json-utils.cpp',
   'profiler.cpp',
+  'perf-stats.cpp',
   'session-manager.cpp',
   'breakpoint-eval.cpp',
   'symbol-render.cpp',
 ]
 
+# Stock-VM support: an SMX debug-info parser (SourcePawn's own v1 reader,
+# vendored into namespace spdbg) plus the debug-break/profiling hooks. This is
+# what lets the extension run on an UNMODIFIED SourcePawn VM.
+stockvmDir = 'stockvm'
+stockvmFiles = [
+  'file-utils.cpp',
+  'rtti.cpp',
+  'smx-v1-image.cpp',
+  'smx-v1-debug-symbols.cpp',
+  'plugin-debug-info.cpp',
+  'vm-hooks.cpp',
+]
+
+# zlib inflate (compressed .smx), from the target SourceMod's SourcePawn tree.
+zlibFiles = ['adler32.c', 'crc32.c', 'inffast.c', 'inflate.c', 'inftrees.c',
+             'uncompr.c', 'zutil.c']
+
 sourceFiles = [os.path.join(upstreamDir, f) for f in upstreamFiles]
 sourceFiles += [os.path.join(dapDir, f) for f in dapFiles]
+sourceFiles += [os.path.join(stockvmDir, f) for f in stockvmFiles]
+sourceFiles += [os.path.join(Extension.sm_root, 'sourcepawn', 'third_party', 'zlib', f)
+                for f in zlibFiles]
 sourceFiles += [os.path.join(Extension.sm_root, 'public', 'smsdk_ext.cpp')]
 
 ###############

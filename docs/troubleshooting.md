@@ -12,10 +12,11 @@ This guide addresses common issues and their solutions. It's organized by sympto
 4. [Variable Inspection Issues](#variable-inspection-issues)
 5. [Transport Anomalies](#transport-anomalies)
 6. [Profiler Issues](#profiler-issues)
-7. [Timeout Issues](#timeout-issues)
-8. [Path Mapping](#path-mapping)
-9. [Reconnection Behavior](#reconnection-behavior)
-10. [Performance Considerations](#performance-considerations)
+7. [SourceMod & VM Compatibility](#sourcemod--vm-compatibility)
+8. [Timeout Issues](#timeout-issues)
+9. [Path Mapping](#path-mapping)
+10. [Reconnection Behavior](#reconnection-behavior)
+11. [Performance Considerations](#performance-considerations)
 
 ## The Freeze Model
 
@@ -491,33 +492,24 @@ the server log (`addons/sourcemod/logs/...`) shows
 `SourcePawn v2 engine unavailable; function profiler disabled`, preceded by a
 `[profiler-init] ...` line.
 
-**Cause:** the profiler needs the **patched `debug_api_symbols` SourcePawn VM**
-loaded, and the extension must locate it on disk. The `[profiler-init]` line
-tells you which step failed:
+**Cause:** the VM's profiling hooks weren't found. They come from the stock VM:
+the public `ISourcePawnEngine2` on 1.12, `sp::Environment::{SetProfilingTool,
+EnableProfiling, DisableProfiling}` from `sourcemod.logic.so`'s symbol table on
+1.13 (see [SourceMod & VM Compatibility](#sourcemod--vm-compatibility)). Look for
+a `[debug-init] ...` line in the SourceMod log:
 
 - `could not open VM library at .../sourcepawn.vm.so` on a **32-bit** server —
-  the 32-bit VM is `sourcepawn.jit.x86.so`, not `sourcepawn.vm.so`. This was a
-  bug (wrong filename for x86) fixed by detecting the architecture from the
-  compiler; make sure you deployed the fixed **x86** extension build.
-- `factory(...) returned null` / `CurrentEnvironment() null` — the VM doesn't
-  expose the factory the profiler needs.
-- `env=0x... APIv2()=0x0` — the env exists but the v2 engine isn't available;
-  the loaded VM doesn't support the profiling API.
+  the 32-bit VM is `sourcepawn.jit.x86.so`; make sure you deployed the **x86**
+  extension build.
+- `no live SourcePawn environment` — the library opened but isn't the VM the
+  server is running.
+- On 1.13: `cannot reach the SourcePawn VM debug hooks` — see above.
 
-**Solutions:**
+**Solutions:** deploy the package for your SourceMod line and architecture, and
+**fully restart** the server (not `sm exts reload`) so the extension registers the
+profiling tool before plugins run.
 
-1. **Deploy the patched VM.** It ships in the CI build artifact under
-   `addons/sourcemod/bin/` (x86: `sourcepawn.jit.x86.so`, x64:
-   `x64/sourcepawn.vm.so`). A plain local `ambuild` of the extension does **not**
-   build it. Back up the existing VM before replacing it.
-2. **Match the architecture.** Deploy the lib for your server's bitness (CS:S is
-   typically 32-bit → `sourcepawn.jit.x86.so`).
-3. **Full restart** the server after deploying (not `sm exts reload`), so the
-   extension loads and registers the profiling tool before plugins run.
-
-Note: regular breakpoints can still work via `EnableLineDebugging` even when the
-profiler can't initialize — the profiler has the stricter requirement of
-reaching the VM's v2 engine.
+Note: regular breakpoints can work even when the profiler can't initialize.
 
 ### Profile shows functions from other plugins
 
@@ -531,6 +523,95 @@ flame-chart table if you only care about one plugin.
 **Expected.** Profiling (and line debugging) add per-call overhead and slow the
 VM. Use the results as a **relative ranking** of what's expensive, not as
 absolute production latency.
+
+## SourceMod & VM Compatibility
+
+The debugger runs on the **stock, unmodified SourcePawn VM** of SourceMod 1.12
+and 1.13. Nothing but `sp-debugger.ext.so` is deployed. Build one package per
+SourceMod line: the extension API version is baked in from the SDK headers, so a
+1.13 build is refused by 1.12 (*"Extension version is too new to load"*).
+
+| | SourceMod 1.12 | SourceMod 1.13 (SourcePawn 2.0) |
+|---|---|---|
+| VM | `sourcepawn.jit.x86.so` / `x64/sourcepawn.vm.so`, `dlopen`ed by SourceMod | linked into `sourcemod.logic.so` |
+| Debug-break hook | public `SetDebugBreakHandler`; extension calls `EnableDebugBreak` at startup | `sp::Environment::*` resolved from `logic.so`'s `.symtab` |
+| `core.cfg` | nothing (no such option) | `"EnableLineDebugging" "yes"` |
+| Debuggable plugins | all | all: default `spcomp` (SMX v2) and `oldspcomp` (SMX v1) |
+| Platform | Linux (Windows untested) | Linux only |
+
+Startup prints which path was taken:
+`SourcePawn debugger attached: SourcePawn 1.x, stock sourcepawn.jit.x86 (public split API)`
+or `... SourcePawn 2.0, stock sourcemod.logic (sp::Environment via .symtab)`.
+
+### Every plugin fails with "Unable to load plugin (invalid global variable address)" (SourceMod 1.12)
+
+**Cause:** a bug in the stock 1.12 VM that only shows once line debugging is on.
+`spcomp` 1.12 puts one constant-marker symbol (address `0x80000000`) in the
+`.dbg.globals` of *every* plugin, and `SmxV1Image::validateDebugVariables()`
+(with `validateSymbolAddress()` inlined) rejects it. Nothing in 1.12 turns line
+debugging on by itself, so the bug never showed until a debugger did.
+
+**What the extension does:** at startup, before any plugin loads, it overwrites
+that validator in memory with `mov eax,1 ; ret` (6 bytes, x86 and x86_64; resolved
+from the VM library's `.symtab`, and left alone if the symbol is missing). The VM
+never uses these addresses to run code and the extension re-validates them itself.
+The log shows `[debug-init] relaxed stock VM debug-symbol validation`.
+
+If you still see the error: the extension loaded *late* (`sm exts load`) — restart
+the server; the line is absent (non-Linux, stripped VM library, or the extension
+isn't loaded before plugins). Recompiling the plugins does not help.
+
+### "No debug info for <plugin>.smx: ..." (any SourceMod)
+
+The extension reads the plugin's own `.smx`, so it needs debug sections in it
+(`spcomp -g`, the default). The text after the colon says which table is bad
+(`cannot parse .smx: <reason>`) or that the file has none. The plugin keeps
+running; it just can't be stopped in.
+
+### Breakpoint on a v2 plugin doesn't stop (SourceMod 1.13)
+
+SourcePawn 2.0 lowers bytecode lazily, so several source lines can start at the same
+low-level instruction and the VM only reports the first one. The extension recovers
+the others (`[debug-init] SourcePawn 2.0 line-boundary hook installed` in the
+SourceMod log confirms it is active, and `debug_log` `1` prints the affected groups as
+`[v2-lines] pc N: ... (hidden -> hooked)`).
+
+If that line is missing, the hook could not be installed -- the log says why (it needs
+exactly one call to `SmxImage::IsLineBoundary` in the interpreter, so a different
+SourcePawn build is not hooked) and lines whose first operation shares an instruction
+with an earlier line may not stop.
+
+### v2 plugin: server slower while debugging (SourceMod 1.13)
+
+The 2.0 VM only calls a debugger from its interpreter. When a client starts
+debugging a v2 plugin the extension turns the JIT off for the whole VM and turns it
+back on when the last client leaves (it won't re-enable a JIT you disabled yourself).
+Legacy plugins don't need this and keep the JIT.
+
+### "cannot reach the SourcePawn VM debug hooks: ..." (SourceMod 1.13)
+
+On 1.13 the hooks are found in `sourcemod.logic.so`'s symbol table. Official
+builds are not stripped. The message tells you what is missing:
+`has no .symtab (stripped build?)`, or `sp::Environment::{get,...} not found`.
+A custom build with stripped symbols is not supported. It also refuses to hook if
+`Environment::get()` is not the engine SourceMod handed over.
+
+### "Failed to install debugger in the SourcePawn VM"
+
+Line debugging is off. On 1.13 set `"EnableLineDebugging" "yes"` in `core.cfg`; on
+both lines the extension must load at **server start** — a late load can't enable
+it because plugins are already compiled.
+
+### "SourcePawn VM API mismatch"
+
+The package doesn't match the SourceMod line (a 1.12 build on 1.13 or the
+reverse). Use the `sm1.12` or `sm1.13` package.
+
+### Server crashed in the extension
+
+Run `coredumpctl gdb` (or open the core) on the server binary. Frames in
+`SpPluginDebugInfo`/`BreakpointManager` point at debug-info handling — please
+report with `debug_log` set to `1` in `console-debugger.cfg`.
 
 ## Timeout Issues
 

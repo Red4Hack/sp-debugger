@@ -610,8 +610,9 @@ export class SourcePawnDebugSession extends LoggingDebugSession {
   /**
    * Custom (non-standard-DAP) requests. The function profiler uses
    * `sp_profileStart` / `sp_profileStop`, dispatched from the VS Code commands
-   * via `session.customRequest(...)`. We pass them straight through to the
-   * server and echo its response body (e.g. `{ tree: ... }`).
+   * via `session.customRequest(...)`; the Realtime Performance panel polls
+   * `sp_performance`. We pass them straight through to the server and echo its
+   * response body (e.g. `{ tree: ... }`).
    */
   protected async customRequest(
     command: string,
@@ -625,6 +626,17 @@ export class SourcePawnDebugSession extends LoggingDebugSession {
         this.sendResponse(response);
       } catch (error) {
         this.sendErrorResponse(response, 2030, `${command} failed: ${error}`);
+      }
+      return;
+    }
+    if (command === "sp_performance") {
+      try {
+        // Polled every second: fail fast instead of queueing behind a stuck poll.
+        const body = await this.sessionManager.sendCustomRequest(command, args, 3000);
+        response.body = body ?? {};
+        this.sendResponse(response);
+      } catch (error) {
+        this.sendErrorResponse(response, 2032, `${command} failed: ${error}`);
       }
       return;
     }

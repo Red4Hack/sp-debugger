@@ -7,6 +7,7 @@
  */
 
 #include "dap-handlers.h"
+#include "vm-hooks.h"
 #include "json-utils.h"
 #include "dap-bridge.h"
 #include "debugger.h"
@@ -14,6 +15,7 @@
 #include "symbols.h"
 #include "symbol-render.h"
 #include "profiler.h"
+#include "perf-stats.h"
 #include "smsdk_ext.h"
 #include "config.h"
 #include <algorithm>
@@ -125,7 +127,7 @@ const char* DAPHandlers::path_basename(const char* path)
     return last_slash ? (last_slash + 1) : path;
 }
 
-std::string DAPHandlers::GetVariableValue(const SourcePawn::IDebugSymbol* symbol, SourcePawn::IPluginDebugInfo* debuginfo, Debugger* debugger)
+std::string DAPHandlers::GetVariableValue(const SourcePawn::IDebugSymbol* symbol, SpPluginDebugInfo* debuginfo, Debugger* debugger)
 {
     if (!debugger || !symbol) return "undefined";
 
@@ -136,7 +138,7 @@ std::string DAPHandlers::GetVariableValue(const SourcePawn::IDebugSymbol* symbol
     return dap::GetSummaryValue(wrapper);
 }
 
-std::string DAPHandlers::GetVariableTypeName(const SourcePawn::IDebugSymbol* symbol, SourcePawn::IPluginDebugInfo* debuginfo, Debugger* debugger)
+std::string DAPHandlers::GetVariableTypeName(const SourcePawn::IDebugSymbol* symbol, SpPluginDebugInfo* debuginfo, Debugger* debugger)
 {
     if (!symbol) return "unknown";
     if (!debugger) return "unknown";
@@ -262,6 +264,9 @@ void DAPHandlers::HandleRequest(ClientConnection* client, std::unique_ptr<DAPReq
     }
     else if (command == "sp_profileStop") {
         HandleProfileStop(client, std::move(request));
+    }
+    else if (command == "sp_performance") {
+        HandlePerformance(client, std::move(request));
     }
     else {
         SPDBG_LOG("[SM] DAP HandleRequest - Unknown command: %s", command.c_str());
@@ -827,6 +832,18 @@ void DAPHandlers::HandleStackTrace(ClientConnection* client, std::unique_ptr<DAP
                         // Get source file and line for scripted frames
                         const char* file_path = frames->FilePath();
                         int line_number = frames->LineNumber();
+#if defined(SPDBG_MERGED_ENV_API)
+                        // SourcePawn 2.0 can start several source lines at one
+                        // instruction; the top frame shows the one we stopped for.
+                        if (frame_index == 0) {
+                            if (SpPluginDebugInfo* info = SpDebugInfo(ctx->GetRuntime())) {
+                                uint32_t stop_line = 0;
+                                if (info->IsV2() &&
+                                    info->LookupLine(static_cast<ucell_t>(debugger->breakcip()), &stop_line) == SP_ERROR_NONE)
+                                    line_number = static_cast<int>(stop_line);
+                            }
+                        }
+#endif
 
                         if (file_path) {
                             auto source = JsonParser::CreateObject();
@@ -1002,7 +1019,7 @@ void DAPHandlers::HandleVariables(ClientConnection* client, std::unique_ptr<DAPR
                 if (!debugger->SelectFrame(frame_id)) {
                     SPDBG_LOG("[SM] DAP Variables - Frame %d not selectable", frame_id);
                 } else {
-                    IPluginDebugInfo *debuginfo = debugger->GetDebugInfo();
+                    SpPluginDebugInfo *debuginfo = debugger->GetDebugInfo();
 
                     if (is_handle) {
                         // Expanding an aggregate: re-resolve the root symbol by
@@ -1552,7 +1569,9 @@ std::string DAPHandlers::EvaluateExpression(const std::string& expression, Debug
     // bailed on because of the [ and + characters.
     std::string ident = ExtractIdentifier(expression);
     if (!ident.empty()) {
-        IPluginDebugInfo *debuginfo = debugger->ctx()->GetRuntime()->GetDebugInfo();
+        SpPluginDebugInfo *debuginfo = SpDebugInfo(debugger->ctx()->GetRuntime());
+        if (!debuginfo)
+            return "<debug info unavailable>";
         IDebugSymbolIterator* symbol_iterator = debuginfo->CreateSymbolIterator(debugger->cip());
 
         while (!symbol_iterator->Done()) {
@@ -1597,6 +1616,46 @@ std::string DAPHandlers::EvaluateExpression(const std::string& expression, Debug
     return "<expression evaluation not supported: " + expression + ">";
 }
 
+// Raw CPU / memory counters of the server (see perf-stats.h). Cumulative CPU
+// times, not percentages: the client samples twice and divides. Answered from
+// the TCP thread, so it also works while the VM is paused at a breakpoint.
+void DAPHandlers::HandlePerformance(ClientConnection* client, std::unique_ptr<DAPRequest> request)
+{
+    auto response = std::make_unique<DAPResponse>(
+        ++g_response_seq_counter, request->GetSeq(), "sp_performance", true);
+
+    // Arguments: { resetPeaks: true } forgets the peak stack/heap seen so far.
+    if (auto args = request->GetArguments()) {
+        if (args->HasMember("resetPeaks") && (*args)["resetPeaks"]->AsBool())
+            dap::perf::ResetPeaks();
+    }
+
+    SourcePawn::IPluginContext* active_ctx =
+        client->active_plugin ? client->active_plugin->GetBaseContext() : nullptr;
+    const dap::perf::Sample s = dap::perf::Take(client->active_plugin_name.c_str(), active_ctx);
+    auto body = JsonParser::CreateObject();
+    JsonParser::AddToObject(*body, "wallMs", std::make_shared<JsonValue>(s.wall_ms));
+    JsonParser::AddToObject(*body, "processCpuMs", std::make_shared<JsonValue>(s.process_cpu_ms));
+    JsonParser::AddToObject(*body, "mainCpuMs", std::make_shared<JsonValue>(s.main_cpu_ms));
+    JsonParser::AddToObject(*body, "rssBytes", std::make_shared<JsonValue>(s.rss_bytes));
+    JsonParser::AddToObject(*body, "pluginBytes", std::make_shared<JsonValue>(s.plugin_bytes));
+    JsonParser::AddToObject(*body, "pluginAgeMs", std::make_shared<JsonValue>(s.plugin_age_ms));
+    const std::string kind = s.debug_kind == 1 ? "legacy" : s.debug_kind == 2 ? "v2" : "";
+    JsonParser::AddToObject(*body, "debugPlugin", std::make_shared<JsonValue>(s.debug_plugin));
+    JsonParser::AddToObject(*body, "debugKind", std::make_shared<JsonValue>(kind));
+    JsonParser::AddToObject(*body, "stackHeapBytes", std::make_shared<JsonValue>(s.debug_stack_heap_bytes));
+    JsonParser::AddToObject(*body, "dataBytes", std::make_shared<JsonValue>(s.debug_data_bytes));
+    JsonParser::AddToObject(*body, "heapLiveBytes", std::make_shared<JsonValue>(s.debug_heap_live_bytes));
+    JsonParser::AddToObject(*body, "stackPeakBytes", std::make_shared<JsonValue>(s.debug_stack_peak_bytes));
+    JsonParser::AddToObject(*body, "heapPeakBytes", std::make_shared<JsonValue>(s.debug_heap_peak_bytes));
+    JsonParser::AddToObject(*body, "usedPeakBytes", std::make_shared<JsonValue>(s.debug_used_peak_bytes));
+    JsonParser::AddToObject(*body, "peakSamples", std::make_shared<JsonValue>(s.debug_peak_samples));
+    JsonParser::AddToObject(*body, "plugins", std::make_shared<JsonValue>(s.plugins));
+    JsonParser::AddToObject(*body, "cpus", std::make_shared<JsonValue>(s.cpus));
+    response->SetBody(body);
+    SendResponse(client, std::move(response));
+}
+
 void DAPHandlers::HandleProfileStart(ClientConnection* client, std::unique_ptr<DAPRequest> request)
 {
     auto response = std::make_unique<DAPResponse>(
@@ -1610,7 +1669,7 @@ void DAPHandlers::HandleProfileStart(ClientConnection* client, std::unique_ptr<D
     // numbers measured on different clocks -- so it is no longer serialized.
     Profiler* vmProf = debugger_ext_->GetVMProfiler();
     Profiler* tracedProf = debugger_ext_->GetTracedProfiler();
-    SourcePawn::ISourcePawnEngine2* engine2 = debugger_ext_->GetEngine2();
+    const bool engine2 = debugger_ext_->HasVmProfiling();
     bool started = false;
     // Stamp the real wall-clock start of the capture window up front, so it
     // covers both the traced ("this plugin") and VM ("all plugins") paths --
@@ -1623,7 +1682,7 @@ void DAPHandlers::HandleProfileStart(ClientConnection* client, std::unique_ptr<D
     debugger_ext_->SetVmInvokeTracking(vmTracking);
     if (vmTracking) {
         vmProf->Reset();
-        engine2->EnableProfiling();
+        spdbg::vm::EnableProfiling();
         vmProf->Start();
         started = true;
     }
@@ -1649,7 +1708,7 @@ void DAPHandlers::HandleProfileStop(ClientConnection* client, std::unique_ptr<DA
 
     Profiler* vmProf = debugger_ext_->GetVMProfiler();
     Profiler* tracedProf = debugger_ext_->GetTracedProfiler();
-    SourcePawn::ISourcePawnEngine2* engine2 = debugger_ext_->GetEngine2();
+    const bool engine2 = debugger_ext_->HasVmProfiling();
 
     // capture = {"tree":..., "samples":..., "spans":...} -- the measured call
     // tree plus the measured timeline behind it.
@@ -1663,7 +1722,7 @@ void DAPHandlers::HandleProfileStop(ClientConnection* client, std::unique_ptr<DA
     // without reading its tree.
     if (vmProf) {
         if (engine2)
-            engine2->DisableProfiling();
+            spdbg::vm::DisableProfiling();
         vmProf->Stop(nullptr);
     }
     SPDBG_LOG("[SM] DAP ProfileStop - capture=%zuB", capture.size());
@@ -1830,7 +1889,9 @@ void DAPHandlers::HandleDataBreakpointInfo(ClientConnection* client, std::unique
             if (client->active_plugin) {
                 auto debugger = debugger_ext_->GetPluginDebugger(client->active_plugin->GetBaseContext());
                 if (debugger && debugger->active()) {
-                    IPluginDebugInfo *debuginfo = debugger->ctx()->GetRuntime()->GetDebugInfo();
+                    SpPluginDebugInfo *debuginfo = SpDebugInfo(debugger->ctx()->GetRuntime());
+                    if (!debuginfo)
+                        return;
                     IDebugSymbolIterator* symbol_iterator = debuginfo->CreateSymbolIterator(debugger->cip());
 
                     bool found = false;
@@ -1948,7 +2009,7 @@ void DAPHandlers::HandleReadMemory(ClientConnection* client, std::unique_ptr<DAP
                     // step is a whole cell. Advancing by 1 read overlapping
                     // cells and shifted every byte after the first.
                     const cell_t cell_addr = address + static_cast<cell_t>(i * sizeof(cell_t));
-                    if (debugger->ctx()->LocalToPhysAddr(cell_addr, &phys_addr) == SP_ERROR_NONE) {
+                    if (SpLocalToPhys(debugger->ctx(), cell_addr, sizeof(cell_t), &phys_addr) == SP_ERROR_NONE) {
                         cell_t value = *phys_addr;
 
                         // Extract bytes from cell (little-endian)
@@ -1993,8 +2054,13 @@ void DAPHandlers::HandleReadMemory(ClientConnection* client, std::unique_ptr<DAP
 
                     SPDBG_LOG("[SM] DAP ReadMemory - Read %d bytes from 0x%x", bytes_read, address);
                 } else {
-                    SendErrorResponse(client, request->GetSeq(), "readMemory", "Failed to read memory at specified address");
-                    return;
+                    // Nothing readable there. The DAP way to say so is a normal
+                    // response carrying only unreadableBytes (SourcePawn 2.0 does
+                    // not map the low part of the plugin's address space).
+                    char addr_buf[32];
+                    snprintf(addr_buf, sizeof(addr_buf), "0x%x", static_cast<unsigned int>(address));
+                    JsonParser::AddToObject(*body, "address", std::make_shared<JsonValue>(addr_buf));
+                    JsonParser::AddToObject(*body, "unreadableBytes", std::make_shared<JsonValue>(count));
                 }
             } else {
                 SendErrorResponse(client, request->GetSeq(), "readMemory", "No active debugger");
@@ -2019,7 +2085,9 @@ std::pair<bool, std::string> DAPHandlers::SetVariableValue(const std::string& na
         return std::make_pair(false, "<no active debugger>");
     }
 
-    IPluginDebugInfo *debuginfo = debugger->ctx()->GetRuntime()->GetDebugInfo();
+    SpPluginDebugInfo *debuginfo = SpDebugInfo(debugger->ctx()->GetRuntime());
+    if (!debuginfo)
+        return {false, "<debug info unavailable>"};
     IDebugSymbolIterator* symbol_iterator = debuginfo->CreateSymbolIterator(debugger->cip());
 
     while (!symbol_iterator->Done()) {
@@ -2067,7 +2135,7 @@ std::pair<bool, std::string> DAPHandlers::SetVariableValue(const std::string& na
 
             // Write the value to memory
             cell_t* phys_addr;
-            if (debugger->ctx() && debugger->ctx()->LocalToPhysAddr(address, &phys_addr) == SP_ERROR_NONE) {
+            if (debugger->ctx() && SpLocalToPhys(debugger->ctx(), address, sizeof(cell_t), &phys_addr) == SP_ERROR_NONE) {
                 *phys_addr = new_value;
 
                 // Verify the write by reading back
@@ -2102,7 +2170,9 @@ DAPHandlers::SetArrayElement(ClientConnection* client, int var_ref,
         return {false, "<invalid index: " + name + ">"};
     const cell_t index = static_cast<cell_t>(idx_l);
 
-    IPluginDebugInfo* debuginfo = debugger->ctx()->GetRuntime()->GetDebugInfo();
+    SpPluginDebugInfo* debuginfo = SpDebugInfo(debugger->ctx()->GetRuntime());
+    if (!debuginfo)
+        return {false, "<debug info unavailable>"};
     IDebugSymbolIterator* it = debuginfo->CreateSymbolIterator(debugger->cip());
     const SourcePawn::IDebugSymbol* parent = nullptr;
     while (!it->Done()) {
@@ -2182,7 +2252,7 @@ DAPHandlers::SetArrayElement(ClientConnection* client, int var_ref,
         const cell_t cell_addr = addr - (addr % static_cast<cell_t>(sizeof(cell_t)));
         const int byte_in_cell = static_cast<int>(addr % static_cast<cell_t>(sizeof(cell_t)));
         cell_t* cell = nullptr;
-        if (debugger->ctx()->LocalToPhysAddr(cell_addr, &cell) != SP_ERROR_NONE || !cell) {
+        if (SpLocalToPhys(debugger->ctx(), cell_addr, sizeof(cell_t), &cell) != SP_ERROR_NONE || !cell) {
             debuginfo->DestroySymbolIterator(it);
             return {false, "<element address out of range>"};
         }
@@ -2194,7 +2264,7 @@ DAPHandlers::SetArrayElement(ClientConnection* client, int var_ref,
     }
 
     cell_t* phys = nullptr;
-    if (debugger->ctx()->LocalToPhysAddr(addr, &phys) != SP_ERROR_NONE || !phys) {
+    if (SpLocalToPhys(debugger->ctx(), addr, sizeof(cell_t), &phys) != SP_ERROR_NONE || !phys) {
         debuginfo->DestroySymbolIterator(it);
         return {false, "<element address out of range>"};
     }

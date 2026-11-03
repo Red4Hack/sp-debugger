@@ -33,6 +33,7 @@
 #define _INCLUDE_DAP_HANDLERS_H
 
 #include <string>
+#include "plugin-debug-info.h"
 #include <memory>
 #include "tcp-server.h"
 
@@ -87,6 +88,7 @@ private:
     // profiling; Stop disables it and returns the accumulated call tree.
     void HandleProfileStart(ClientConnection* client, std::unique_ptr<DAPRequest> request);
     void HandleProfileStop(ClientConnection* client, std::unique_ptr<DAPRequest> request);
+    void HandlePerformance(ClientConnection* client, std::unique_ptr<DAPRequest> request);
 
     // Returns details (message) of the exception the debugged plugin is stopped
     // on, for VS Code's exception widget.
@@ -113,8 +115,8 @@ private:
     Debugger* AnyActiveDebugger();
     Debugger* ActiveDebuggerFor(ClientConnection* client);
 
-    std::string GetVariableValue(const SourcePawn::IDebugSymbol* symbol, SourcePawn::IPluginDebugInfo* debuginfo, Debugger* debugger);
-    std::string GetVariableTypeName(const SourcePawn::IDebugSymbol* symbol, SourcePawn::IPluginDebugInfo* debuginfo, Debugger* debugger);
+    std::string GetVariableValue(const SourcePawn::IDebugSymbol* symbol, SpPluginDebugInfo* debuginfo, Debugger* debugger);
+    std::string GetVariableTypeName(const SourcePawn::IDebugSymbol* symbol, SpPluginDebugInfo* debuginfo, Debugger* debugger);
     std::string EvaluateExpression(const std::string& expression, Debugger* debugger);
     std::pair<bool, std::string> SetVariableValue(const std::string& name, const std::string& value, Debugger* debugger);
     // setVariable on an aggregate child named "[N]" -- the VS Code "edit value"

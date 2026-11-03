@@ -521,9 +521,10 @@ The VS Code adapter (`debugAdapter.ts`) drives this sequence:
 
 ## Custom Commands (Profiler)
 
-Beyond standard DAP, the server implements two custom requests for the function
-profiler. The VS Code commands dispatch them via `session.customRequest(...)`;
-the adapter's `customRequest` override forwards them to the server unchanged.
+Beyond standard DAP, the server implements three custom requests: two for the
+function profiler and one for the Realtime Performance panel. The VS Code side
+dispatches them via `session.customRequest(...)`; the adapter's `customRequest`
+override forwards them to the server unchanged.
 
 ### `sp_profileStart`
 
@@ -542,7 +543,7 @@ Response body:
 { "active": true }
 ```
 
-`active` is `false` when the VM's v2 engine / patched VM is unavailable (the
+`active` is `false` when the VM's profiling hooks could not be found (the
 profiler can't run); the client then shows an error instead of recording.
 
 ### `sp_profileStop`
@@ -617,6 +618,84 @@ was removed. Time is only credited while the plugin executes -- idle between
 server frames is deliberately excluded, so percentages are a share of traced
 execution, not of wall time. `windowMs` is the real length of the capture window.
 
+### `sp_performance`
+
+Raw CPU / memory counters of the server process, for the Realtime Performance
+panel. The values are cumulative or instantaneous, never percentages: the client
+polls (once a second) and divides the deltas, so the server keeps no per-client
+state. It is answered from the TCP thread, so it works while the VM is paused at
+a breakpoint.
+
+```json
+{ "seq": 42, "type": "request", "command": "sp_performance", "arguments": {} }
+```
+
+Response body (all numbers):
+
+```json
+{
+  "wallMs": 107442399.77,
+  "processCpuMs": 2016.01,
+  "mainCpuMs": 1258.39,
+  "rssBytes": 255082496,
+  "pluginBytes": 1472868,
+  "pluginAgeMs": 350.77,
+  "debugPlugin": "debugger_test.smx",
+  "debugKind": "legacy",
+  "stackHeapBytes": 17032,
+  "dataBytes": 4036,
+  "heapLiveBytes": -1,
+  "stackPeakBytes": 48,
+  "heapPeakBytes": 6048,
+  "usedPeakBytes": 6096,
+  "peakSamples": 85568,
+  "plugins": 18,
+  "cpus": 12
+}
+```
+
+- `wallMs` -- monotonic clock; only differences are meaningful.
+- `processCpuMs` -- CPU time of all threads of the process.
+- `mainCpuMs` -- CPU time of the game thread, which is what the panel plots
+  (100% = the game loop is saturated). `-1` if the platform can't report it; the
+  client then falls back to `processCpuMs / cpus`.
+- `rssBytes` -- resident set of the process.
+- `pluginBytes` / `plugins` -- sum of `IPluginRuntime::GetMemUsage()` over the
+  running plugins (plus the live heap of SourcePawn 2.0 plugins, which that call
+  leaves out), and how many were counted. Refreshed on the game thread (about
+  once a second and on plugin load); `pluginAgeMs` is its age, `-1` before the
+  first measurement.
+- `debugPlugin` -- file name of the plugin this connection launched/attached to
+  (`""` if none). The five fields below describe that plugin, as the compiler
+  sizes it; they are `-1` (and `debugKind` is `""`) when the plugin isn't loaded
+  or its `.smx` can't be read. Servers that predate them omit all five.
+- `debugKind` -- `"legacy"` (built before SourcePawn 2.0: SourceMod 1.12, or
+  1.13's `oldspcomp`) or `"v2"` (SourcePawn 2.0).
+- `stackHeapBytes` -- legacy only: the `Stack/heap size` `spcomp` prints, i.e. the
+  `.data` section's `memsize` minus its `datasize`. `-1` for `"v2"`: the 2.0 VM
+  has no fixed stack/heap and the compiler prints no such line.
+- `dataBytes` -- the `Data size` `spcomp` prints.
+- `heapLiveBytes` -- `"v2"` only: bytes in use in the plugin's allocator heap
+  (sum of mimalloc per-page `used * block_size`; an approximation, Linux only).
+  `-1` for `"legacy"`, or when the allocator's layout isn't recognised.
+- `stackPeakBytes` / `heapPeakBytes` / `usedPeakBytes` -- `"legacy"` only: the
+  most stack, the most heap, and the most of both *together* (peak of the sum,
+  which can be less than the two peaks added) seen in use at any source line since
+  the plugin was launched or the peaks were reset. Read from the plugin's
+  `stp_/sp_/hp_/frm_` fields at every debug break (located by their shape inside
+  the VM object and refused if they don't satisfy `data <= hp <= sp <= frm <= stp`).
+  `-1` until the first sample, for `"v2"`, or if the layout isn't recognised.
+  Compare `usedPeakBytes` with `stackHeapBytes` for the headroom. Local arrays
+  count as heap.
+- `peakSamples` -- how many lines contributed (0 = none yet).
+- `cpus` -- logical CPUs.
+
+Request argument `{ "resetPeaks": true }` forgets the peaks (the panel sends it
+when the peak line is clicked).
+
+On Linux this reads `CLOCK_PROCESS_CPUTIME_ID`, the main thread's CPU clock and
+`/proc/self/statm`. The Windows path (`GetProcessTimes`, `GetThreadTimes`,
+`GetProcessMemoryInfo`) is written but untested.
 ## Error Handling
 
 ### Malformed JSON

@@ -18,28 +18,30 @@
 #include <string>
 
 // sp_debug_break_info_t and cell_t are SourcePawn typedefs, not forward-
-// declarable. Every file that includes this header pulls in the SourcePawn VM
-// headers first, so the names are already in scope by the time these signatures
-// are parsed.
+// declarable, so pull the VM header in directly. Do NOT forward-declare
+// IPluginContext / ISourcePawnEngine2 here: since the 2026-05 API rework they
+// are `typedef`s (IPluginRuntime and ISourcePawnEnvironment respectively), and
+// a `class` re-declaration is a hard error on that SourceMod. Including the
+// header works on both the split and the merged API.
+#include <sp_vm_api.h>
 class ConsoleDebugger;
 class Debugger;
-
-namespace SourcePawn {
-class IPluginContext;
-class ISourcePawnEngine2;
-}
 
 namespace SourceMod {
 class IPlugin;
 }
 
+// Debug info for a plugin, parsed from its .smx by the extension itself, so the
+// stock (unpatched) SourcePawn VM is enough. See stockvm/plugin-debug-info.h.
+#include "plugin-debug-info.h"
+
 namespace dap {
 
 // Lifecycle -- called from ConsoleDebugger::SDK_OnLoad / SDK_OnUnload.
-// Init spins up the TCP/DAP server and the profilers; engine2 is the v2
-// SourcePawn engine captured by the extension (may be null -> "All plugins"
-// profiler disabled).
-void Init(ConsoleDebugger* ext, SourcePawn::ISourcePawnEngine2* engine2);
+// Init spins up the TCP/DAP server and the profilers; vm_profiling says whether
+// the VM's profiling hooks were found (stockvm/vm-hooks.h) -- false disables the
+// "All plugins" profiler.
+void Init(ConsoleDebugger* ext, bool vm_profiling);
 void Shutdown();
 
 // Plugin reload handling -- called from ConsoleDebugger::OnPluginLoaded /

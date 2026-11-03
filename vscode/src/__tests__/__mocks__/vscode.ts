@@ -27,6 +27,7 @@ export const window = {
     dispose: mock(() => {}),
   })),
   registerTreeDataProvider: mock(() => ({ dispose: () => {} })),
+  registerWebviewViewProvider: mock(() => ({ dispose: () => {} })),
   setStatusBarMessage: mock(() => ({ dispose: () => {} })),
   showErrorMessage: mock(async () => undefined),
   showWarningMessage: mock(async () => undefined),

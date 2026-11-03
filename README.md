@@ -10,6 +10,7 @@ A remote debugger for SourcePawn plugins running on a live game server (CS:S, TF
 - **Debug Console REPL** — Type commands (`bt`, `p`, `x`, `break`, `set`, etc.) while paused
 - **Data Breakpoints** — Watchpoints on global/static variables
 - **Memory Inspection** — Hex viewer
+- **Realtime Performance** — Live CPU (game thread) and memory (process + plugins) chart of the server, also while paused at a breakpoint
 - **Function Profiler** — Non-pausing capture with flame chart (per-line heat), per-call min/p95/max, and a Perfetto timeline export
 
 **Key feature:** Snapshot logpoints (`{@all}`, `{@locals}`, `{@args}`) capture variable state and continue immediately without freezing the server — ideal for production debugging.
@@ -20,7 +21,7 @@ A remote debugger for SourcePawn plugins running on a live game server (CS:S, TF
 
 1. **Download** from GitHub Releases:
    - `sp-debugger.vsix` — VS Code extension
-   - `sp-debugger-server-<os>-<sm>.tar.gz` (Linux) or `.zip` (Windows) — Server package (includes the patched SourcePawn VM)
+   - `sp-debugger-server-<os>-<sm>.tar.gz` (Linux) or `.zip` (Windows, untested) — Server package (just `sp-debugger.ext.so` — runs on the stock SourcePawn VM)
 
    **Pick the package matching your server's SourceMod line**: `sm1.12` for
    stable SourceMod 1.12, `sm1.13` for 1.13-dev builds. Using the wrong one
@@ -84,11 +85,52 @@ The `sp-console-debugger/` source tree is not committed — it is reconstructed 
    ```
    (Or use the VS Code task "Fetch Debugger Source (upstream + patch)".)
 
-2. **Configure and build:**
+2. **Configure and build** against a **stock** SourceMod checkout (submodules
+   initialised; no VM patch of any kind):
    ```bash
    .venv/bin/python configure.py --enable-optimize --targets=x86,x86_64 --sm-path=/path/to/sourcemod
    .venv/bin/ambuild objdir
    ```
+   `configure.py` reads the target's `sourcepawn/include/sp_vm_api.h` and picks the
+   VM-access path for that SourceMod line by itself, so build once per line (the
+   extension API version differs and 1.12 refuses a 1.13 build).
+
+### SourceMod compatibility
+
+The extension runs on the **stock, unmodified SourcePawn VM** of both SourceMod
+lines — you deploy only `sp-debugger.ext.so`. It no longer asks the VM for debug
+information (that is what needed a patched VM): it reads the plugin's `.smx`
+itself (`stockvm/`), and only the debug-break / profiling hooks come from the VM.
+
+| SourceMod | VM | Debug-break hook | Plugins you can debug |
+|---|---|---|---|
+| **1.12** | `sourcepawn.jit.x86.so` / `x64/sourcepawn.vm.so` | public `SetDebugBreakHandler`; the extension turns line debugging on at server start | every plugin `spcomp` 1.12 produces |
+| **1.13** (SourcePawn 2.0) | linked into `sourcemod.logic.so` | `sp::Environment` members resolved from `logic.so`'s symbol table (Linux) | every plugin: the default **`spcomp`** (SMX v2) and legacy `oldspcomp` (SMX v1) |
+
+- **1.12** — set nothing in `core.cfg` (the option does not exist there). The
+  extension must load at server start, not late.
+- **1.13** — set `"EnableLineDebugging" "yes"` in `core.cfg`. Plugins built with the
+  default `spcomp` (SMX **v2**, register VM) are debugged like any other: breakpoints,
+  stepping, locals, arguments, globals, arrays, strings and enum structs. SourcePawn 2.0
+  only calls a debugger from its *interpreter*, so while a v2 plugin is being debugged
+  the extension switches the JIT off (VM-wide) and restores it when the last client
+  disconnects. Expect interpreted speed on a debugged server, not on a normal one.
+- **Lines that start inside an instruction group** — the 2.0 compiler lowers bytecode
+  lazily, so several source lines can start at one low-level instruction while the VM
+  reports only the first. The extension reads the method's offset map and hooks the
+  interpreter's single `IsLineBoundary` call (restored on unload), so every line with
+  code can hold a breakpoint and be stepped to.
+
+- **Windows** (server): builds in CI but has **not been tested**; the two VM
+  workarounds above (stock 1.12 validator, 1.13 symbol lookup) are Linux-only. Only
+  the VS Code extension is supported there.
+
+Deploying the wrong package fails cleanly: 1.12 servers refuse ext API 9 with
+*"Extension version is too new to load"*, and the extension validates the VM's
+vtable before its first virtual call and declines to load on a mismatch.
+
+See [docs/troubleshooting.md](docs/troubleshooting.md#sourcemod--vm-compatibility)
+for the exact log messages and what they mean.
 
 See [docs/updating-upstream.md](docs/updating-upstream.md) for detailed build instructions and VM requirements.
 
@@ -107,7 +149,7 @@ Run `bun test` from `vscode/` for the unit suite (no setup needed — the DAP in
 
 ## Credits
 
-Built on [peace-maker/sp-console-debugger](https://github.com/peace-maker/sp-console-debugger) and the `debug_api_symbols` branch of the SourcePawn VM.
+Built on [peace-maker/sp-console-debugger](https://github.com/peace-maker/sp-console-debugger) and on SourcePawn's own SMX reader (`stockvm/`, vendored from the `debug_api_symbols` branch and ported to read plugins without VM support).
 
 ## License
 

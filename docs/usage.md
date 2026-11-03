@@ -570,6 +570,68 @@ Click a frame to select it. The Variables and Watch panels update to show locals
 
 **Multi-frame inspection** is supported to 4+ levels deep, so you can step back through the entire call chain.
 
+## Realtime Performance
+
+The **Realtime Performance** view (Run & Debug, next to the SourcePawn Profiler)
+draws the server's load over the last 30 seconds, refreshed once a second while
+the view is visible and a SourcePawn session is active:
+
+- **CPU Usage** (red) -- CPU of the main game thread. 100% means the game loop
+  is saturated, i.e. the server can't keep up. The scale on the left is fixed at
+  0-100%.
+- **Memory Used** (green) -- resident memory of the server process. The scale on
+  the right is rounded up to a round number (shown in the top-right corner) and
+  grows with the data.
+- **Plugins** (blue) -- memory of all running plugins together, with the number
+  of plugins counted. It is part of the process memory, so it shares the same
+  scale and is usually a thin line near the bottom.
+- **Stack/heap** (the ring, no line) -- the size of the plugin **you are
+  debugging**, as the compiler prints it at build time (`Stack/heap size:
+  17032 bytes`). It is a constant, set when the plugin is compiled (see
+  `#pragma dynamic`), so it is shown, not plotted. The plugin's name and its
+  `Data size` are shown under the legend; hover for details.
+  - *Legacy plugins* (SourceMod 1.12, and 1.13 plugins built with
+    `oldspcomp`): read from the `.smx` as the memory size minus the data size,
+    which is exactly the number `spcomp` prints.
+  - *SourcePawn 2.0 plugins* (SourceMod 1.13, default `spcomp`): the compiler
+    prints no such line and the VM has no fixed stack/heap size, so the cell
+    reads **Heap in use** instead -- the bytes in use in the plugin's allocator
+    heap (arrays, strings, closures), an approximation from the allocator's
+    per-page counters.
+
+  Under the legend a **Peak** line (legacy plugins only) says how much of that
+  region the plugin actually used:
+  `Peak 6096 of 18608 bytes (33%) · heap 6048 · stack 48`. It is the most stack
+  + heap seen in use at any source line since the plugin was launched; **click it
+  to reset**. Use it to check whether `#pragma dynamic` is needed and whether a
+  code change helped: the *code* decides the peak, the pragma only decides the
+  reserved size. The same code built without and with `#pragma dynamic 131072`
+  reports the same peak against 18608 and 524288 bytes (33% vs 1.2%).
+  - In SourcePawn, **local arrays live on the heap** (freed when the function
+    returns); the stack only holds call frames and scalars, so the peak is
+    mostly heap. Heap and stack share the one region, which is why they are
+    added together.
+  - It is sampled at every line (the same debug breaks the profiler uses), so a
+    peak that rises and falls inside a single line is missed. It needs the
+    plugin to be compiled with debug info, as debugging itself does. 2.0 plugins
+    have no fixed region and no peak line.
+  - It restarts when you launch/relaunch the plugin or reload it.
+
+  It shows `-` until a plugin is being debugged. The Plugins total includes the
+  live heap of 2.0 plugins (the VM's own estimate leaves it out).
+
+The chart keeps updating while the server is paused at a breakpoint (the
+request is served by the debugger's network thread, not the game thread), which
+makes the CPU line drop to ~0% -- a quick way to see that a pause is in effect.
+If the server stops answering, the last chart stays on screen with a
+"no response" note; if the server restarts the history starts over.
+
+CPU is measured per thread on Linux; the Windows path is untested. The
+live heap of a 2.0 plugin is read from SourceMod's own allocator by its layout;
+that is only available on Linux and has only been verified on 32-bit SourceMod
+1.13. If the layout isn't recognised the cell shows `-` instead of guessing. See
+the [`sp_performance` request](protocol.md#sp_performance) for the raw data.
+
 ## Function Profiler
 
 The profiler records how long each function takes, so you can see what to
@@ -646,11 +708,11 @@ path or reveal it in your file manager.
   treat the numbers as a **ranking** of what's expensive, not as production
   latency. Percentages are a share of the plugin's traced execution, not of wall
   time: idle between server frames is deliberately excluded.
-- **Requires the patched VM.** Profiling needs the `debug_api_symbols`
-  SourcePawn VM present on the server (the same one that powers symbol-aware
-  debugging). If it's missing, the server logs
-  `SourcePawn v2 engine unavailable; function profiler disabled` and the
-  Take Performance Profile action reports the profiler is unavailable. See
+- **Needs the VM's profiling hooks.** They come from the stock VM (no patched
+  build): the public API on SourceMod 1.12, `sourcemod.logic.so`'s symbol table on
+  1.13. If they are missing, the server logs
+  `SourcePawn VM profiling hooks unavailable; 'All plugins' profiler disabled` and
+  the Take Performance Profile action reports the profiler is unavailable. See
   [Troubleshooting](troubleshooting.md).
 
 ## Common Workflows

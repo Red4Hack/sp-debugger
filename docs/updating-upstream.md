@@ -100,8 +100,11 @@ diff -r -x .git -x mock /tmp/spcd-check sp-console-debugger   # should print not
 ## The mock test environment (also pinned)
 
 `sp-console-debugger/tests/setup.sh` assembles what both regression suites run
-against -- hl2sdk-mock, Metamod:Source and SourceMod, the last one built against
-the patched SourcePawn VM (peace-maker's `debug_api_symbols` branch). All four
+against -- hl2sdk-mock, Metamod:Source and SourceMod. The last one is still built
+against a SourcePawn pinned to an old fork commit (peace-maker's
+`debug_api_symbols` branch), because the mock server needs a VM that matches that
+frozen SourceMod snapshot. The **released** extension no longer needs that VM: it
+builds against stock SourcePawn (see the README's compatibility section). All four
 trees are pinned to a commit at the top of that script.
 
 They must be pinned *together*. The patched VM forked from SourcePawn in

@@ -2,7 +2,7 @@
   "name": "sp-debugger",
   "displayName": "SourcePawn Debugger",
   "description": "Remote debugging for SourcePawn plugins directly in VSCode",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "publisher": "ViniciusRed",
   "license": "GPL-3.0-or-later",
   "repository": {
@@ -19,6 +19,7 @@
   "activationEvents": [
     "onDebugResolve:sp-debugger",
     "onView:spDebuggerProfiler",
+    "onView:spDebuggerPerformance",
     "onCommand:sp-debugger.takeProfile",
     "onCommand:sp-debugger.openFlameChart"
   ],
@@ -254,6 +255,13 @@
           "id": "spDebuggerProfiler",
           "name": "SourcePawn Profiler",
           "contextualTitle": "SourcePawn Profiler",
+          "when": "debugType == sp-debugger"
+        },
+        {
+          "type": "webview",
+          "id": "spDebuggerPerformance",
+          "name": "Realtime Performance",
+          "contextualTitle": "SourcePawn Performance",
           "when": "debugType == sp-debugger"
         }
       ]

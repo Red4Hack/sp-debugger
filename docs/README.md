@@ -61,7 +61,7 @@ For production servers, use snapshot logpoints. For development/testing, use nor
 | **Data Breakpoints** | ✓ Full | Watchpoints on global/static variables |
 | **Memory Inspection** | ✓ Full | Hex viewer via `readMemory` |
 | **Debug Console REPL** | ✓ Full | Type commands (`bt`, `p`, `x`, `break`, etc.) while paused |
-| **Function Profiler** | ✓ Full | Non-pausing capture of the debugged plugin → flame chart with per-line heat, per-call min/p95/max, and a Perfetto timeline export (needs the patched VM) |
+| **Function Profiler** | ✓ Full | Non-pausing capture of the debugged plugin → flame chart with per-line heat, per-call min/p95/max, and a Perfetto timeline export (needs the VM profiling hooks, found automatically on the stock VM) |
 
 ## Architecture at a Glance
 
@@ -150,7 +150,7 @@ committed — it is reconstructed from the pinned upstream commit plus our patch
 ```
 
 Requires:
-- SourceMod source tree (with the `debug_api_symbols` SourcePawn branch) at `../sourcemod`
+- A stock SourceMod source tree (1.12-dev or master, submodules initialised; no VM patch) at `../sourcemod`
 - Python venv with ambuild at `.venv/`
 
 ### VS Code Extension

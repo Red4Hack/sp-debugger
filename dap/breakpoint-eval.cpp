@@ -48,7 +48,7 @@ struct ScopeSnapshot {
   std::map<std::string, std::pair<cell_t, bool>> values;  // name -> (cell, is_float)
 };
 
-static void BuildScopeSnapshot(Debugger* debugger_, cell_t cip, ScopeSnapshot* snapshot)
+static void BuildScopeSnapshot(Debugger* debugger_, cell_t cip, cell_t frm, ScopeSnapshot* snapshot)
 {
   snapshot->built = true;
   if (!debugger_)
@@ -56,7 +56,7 @@ static void BuildScopeSnapshot(Debugger* debugger_, cell_t cip, ScopeSnapshot* s
   SourcePawn::IPluginContext* ctx = debugger_->basectx();
   if (!ctx)
     return;
-  IPluginDebugInfo* debuginfo = ctx->GetRuntime()->GetDebugInfo();
+  SpPluginDebugInfo* debuginfo = SpDebugInfo(ctx->GetRuntime());
   if (!debuginfo)
     return;
 
@@ -68,10 +68,10 @@ static void BuildScopeSnapshot(Debugger* debugger_, cell_t cip, ScopeSnapshot* s
     if (!sym || !sym->name())
       continue;
     cell_t address;
-    if (!sp::ResolveSymbolAddress(debugger_, sym, &address))
+    if (!sp::ResolveSymbolAddress(ctx, frm, sym, &address))
       continue;
     cell_t* phys = nullptr;
-    if (ctx->LocalToPhysAddr(address, &phys) != SP_ERROR_NONE || !phys)
+    if (SpLocalToPhys(ctx, address, sizeof(cell_t), &phys) != SP_ERROR_NONE || !phys)
       continue;
     const bool is_float = sym->type() && sym->type()->isFloat32();
     snapshot->values.emplace(sym->name(), std::make_pair(*phys, is_float));
@@ -117,7 +117,7 @@ bool ResolveOperand(Debugger* debugger_, const std::string& token, cell_t cip, c
   if (!snapshot)
     snapshot = &local;
   if (!snapshot->built)
-    BuildScopeSnapshot(debugger_, cip, snapshot);
+    BuildScopeSnapshot(debugger_, cip, frm, snapshot);
 
   auto found = snapshot->values.find(token);
   if (found == snapshot->values.end())
@@ -172,7 +172,7 @@ bool FormatLogExpression(Debugger* debugger_, const std::string& expr, cell_t ci
   SourcePawn::IPluginContext* ctx = debugger_->basectx();
   if (!ctx)
     return false;
-  IPluginDebugInfo* debuginfo = ctx->GetRuntime()->GetDebugInfo();
+  SpPluginDebugInfo* debuginfo = SpDebugInfo(ctx->GetRuntime());
   if (!debuginfo)
     return false;
 
@@ -241,7 +241,7 @@ std::string FormatScopeSnapshot(Debugger* debugger_, cell_t cip, cell_t frm,
   SourcePawn::IPluginContext* ctx = debugger_->basectx();
   if (!ctx)
     return std::string();
-  IPluginDebugInfo* debuginfo = ctx->GetRuntime()->GetDebugInfo();
+  SpPluginDebugInfo* debuginfo = SpDebugInfo(ctx->GetRuntime());
   if (!debuginfo)
     return std::string();
 
@@ -278,7 +278,7 @@ std::string FormatScopeSnapshot(Debugger* debugger_, cell_t cip, cell_t frm,
     cell_t address = (is_local || is_arg) ? (frm + sym->address()) : sym->address();
     cell_t* phys = nullptr;
     char buffer[64];
-    if (ctx->LocalToPhysAddr(address, &phys) == SP_ERROR_NONE && phys) {
+    if (SpLocalToPhys(ctx, address, sizeof(cell_t), &phys) == SP_ERROR_NONE && phys) {
       if (type && type->isFloat32())
         snprintf(buffer, sizeof(buffer), "%g", sp_ctof(*phys));
       else

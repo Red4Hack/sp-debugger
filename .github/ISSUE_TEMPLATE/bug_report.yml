@@ -20,7 +20,7 @@ body:
       options:
         - label: The server was fully restarted after deploying the extension (not `sm exts load` / `reload`)
         - label: The server package matches the server's SourceMod line (`sm1.12` vs `sm1.13`)
-        - label: The patched SourcePawn VM from the release package is installed
+        - label: Line debugging is enabled (SourceMod 1.13 - `"EnableLineDebugging" "yes"` in core.cfg)
         - label: I can reproduce this with only the debugger extension and the plugin involved
 
   - type: textarea
@@ -66,7 +66,7 @@ body:
     attributes:
       label: Versions
       description: Server package and `.vsix` you installed, plus the exact SourceMod build.
-      placeholder: "sp-debugger-server-linux-sm1.12 (release 1.0.3), sp-debugger.vsix 1.0.3, SourceMod 1.12.0.7246"
+      placeholder: "sp-debugger-server-linux-sm1.12 (release 1.1.0), sp-debugger.vsix 1.1.0, SourceMod 1.12.0.7246"
     validations:
       required: true
 

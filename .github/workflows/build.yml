@@ -20,16 +20,24 @@ jobs:
       matrix:
         os:
           - ubuntu-22.04
-          - windows-latest
-        # Build against BOTH SourceMod lines. The extension API version is baked
-        # in from the SDK headers at compile time: master (1.13-dev) is ext API 9,
-        # which stable 1.12 servers refuse with "Extension version is too new to
-        # load (9, max is 8)". Shipping one package per line lets server owners
-        # pick the one matching their SourceMod install.
-        # (Bump branch/label here when a new SourceMod stable rolls.)
+          - windows-latest # not tested by the maintainer
+        # Both SourceMod lines, each built against its own STOCK SourcePawn
+        # headers -- no patched VM. The extension reads plugin debug info from
+        # the .smx itself and reaches the VM's debug-break hook through the
+        # public API (1.12) or sourcemod.logic.so's symbol table (1.13); see
+        # stockvm/vm-hooks.cpp. AMBuildScript picks the right VM-access path by
+        # inspecting the target's sp_vm_api.h.
+        #
+        #   1.12-dev  -- split ISourcePawnEngine/Engine2/Environment, the VM is
+        #                a separate sourcepawn.jit.x86.so that SourceMod dlopens.
+        #   master    -- SourceMod 1.13 (SourcePawn 2.0): merged environment,
+        #                VM statically linked into sourcemod.logic.so.
+        #
+        # The extension API version is baked in from the SDK headers, so one
+        # package per line: 1.12 servers refuse ext API 9 ("too new to load").
         sm:
           - { branch: "1.12-dev", label: "sm1.12" } # stable (ext API 8)
-          - { branch: "master", label: "sm1.13" }   # dev    (ext API 9)
+          - { branch: "master",   label: "sm1.13" } # dev    (ext API 9)
 
     steps:
       - name: Prepare env
@@ -39,8 +47,8 @@ jobs:
 
       # Pin one interpreter for the whole job. setup-python registers it on
       # GITHUB_PATH, so `python` resolves to the SAME environment in every step
-      # regardless of shell -- critical on Windows, where the default steps use
-      # PowerShell but "Build SourcePawn VM" uses Git Bash, and the two would
+      # regardless of shell -- where the default steps use
+      # PowerShell but other steps use Git Bash, and the two would
       # otherwise pick different pythons (only one of which has our pip installs).
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -67,12 +75,12 @@ jobs:
           path: sourcemod
           submodules: recursive
 
-      - name: Switch to debug symbol sourcepawn branch
+      # Stock SourcePawn is enough, but the extension includes its headers and
+      # compiles its bundled zlib, so make sure the submodules are present.
+      - name: Initialise SourceMod submodules
+        shell: bash
         run: |
-          cd sourcemod/sourcepawn
-          git remote add peace https://github.com/peace-maker/sourcepawn.git
-          git fetch peace
-          git switch debug_api_symbols
+          cd sourcemod
           git submodule update --init --recursive
 
       - name: Getting ambuild
@@ -112,56 +120,6 @@ jobs:
         run: |
           python configure.py --enable-optimize --targets x86,x86_64 --sm-path="${{ github.workspace }}/sourcemod"
           ambuild objdir
-
-      - name: Build SourcePawn VM
-        working-directory: sourcemod/sourcepawn
-        shell: bash
-        run: |
-          python configure.py --enable-optimize --targets x86,x86_64
-          ambuild objdir
-          echo "Built libsourcepawn artifacts:"
-          find objdir -name 'libsourcepawn.*' -print
-
-      # The patched (debug_api_symbols) VM MUST ship with the extension -- the
-      # profiler and symbol-aware debugging depend on it. Locate the built libs
-      # by glob (ambuild's exact subfolder can change) and copy to the names the
-      # extension loads: bin/sourcepawn.jit.x86.{so,dll} and bin/x64/sourcepawn.vm.{so,dll}.
-      # Fail loudly if a lib is missing so we never ship a package without the VM.
-      - name: Package SourcePawn VM (Linux)
-        if: runner.os == 'Linux'
-        shell: bash
-        working-directory: sourcemod/sourcepawn
-        run: |
-          set -euo pipefail
-          DEST="${{ github.workspace }}/sp-debugger/objdir/package/addons/sourcemod/bin"
-          mkdir -p "$DEST/x64"
-          x86_lib="$(find objdir -path '*-x86/libsourcepawn.so' ! -path '*x86_64*' | head -n1)"
-          x64_lib="$(find objdir -path '*x86_64/libsourcepawn.so' | head -n1)"
-          echo "x86: ${x86_lib:-<none>}"
-          echo "x64: ${x64_lib:-<none>}"
-          [ -n "$x86_lib" ] || { echo "::error::libsourcepawn.so (x86) not found"; exit 1; }
-          [ -n "$x64_lib" ] || { echo "::error::libsourcepawn.so (x86_64) not found"; exit 1; }
-          cp "$x86_lib" "$DEST/sourcepawn.jit.x86.so"
-          cp "$x64_lib" "$DEST/x64/sourcepawn.vm.so"
-          ls -l "$DEST/sourcepawn.jit.x86.so" "$DEST/x64/sourcepawn.vm.so"
-
-      - name: Package SourcePawn VM (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        working-directory: sourcemod/sourcepawn
-        run: |
-          set -euo pipefail
-          DEST="${{ github.workspace }}/sp-debugger/objdir/package/addons/sourcemod/bin"
-          mkdir -p "$DEST/x64"
-          x86_lib="$(find objdir -path '*-x86/libsourcepawn.dll' ! -path '*x86_64*' | head -n1)"
-          x64_lib="$(find objdir -path '*x86_64/libsourcepawn.dll' | head -n1)"
-          echo "x86: ${x86_lib:-<none>}"
-          echo "x64: ${x64_lib:-<none>}"
-          [ -n "$x86_lib" ] || { echo "::error::libsourcepawn.dll (x86) not found"; exit 1; }
-          [ -n "$x64_lib" ] || { echo "::error::libsourcepawn.dll (x86_64) not found"; exit 1; }
-          cp "$x86_lib" "$DEST/sourcepawn.jit.x86.dll"
-          cp "$x64_lib" "$DEST/x64/sourcepawn.vm.dll"
-          ls -l "$DEST/sourcepawn.jit.x86.dll" "$DEST/x64/sourcepawn.vm.dll"
 
       # Confirm both extension binaries shipped. Fail loudly otherwise so a
       # packaging regression can't slip an empty build out. (The runtime config

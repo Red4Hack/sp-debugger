@@ -36,7 +36,7 @@ class Profiler;
 class DapBridge
 {
 public:
-  DapBridge(ConsoleDebugger* ext, SourcePawn::ISourcePawnEngine2* engine2);
+  DapBridge(ConsoleDebugger* ext, bool vm_profiling);
   ~DapBridge();
 
   // Start the TCP/DAP server + profilers (the DAP part of SDK_OnLoad). Stop and
@@ -68,7 +68,8 @@ public:
   // Profiler accessors (see the long note that used to be in extension.h).
   Profiler* GetVMProfiler() { return vm_profiler_.get(); }
   Profiler* GetTracedProfiler() { return traced_profiler_.get(); }
-  SourcePawn::ISourcePawnEngine2* GetEngine2() { return spengine2_; }
+  // VM profiling hooks available (spdbg::vm::Enable/DisableProfiling).
+  bool HasVmProfiling() const { return vm_profiling_; }
 
   // Debug-break tracer driving traced_profiler_.
   void BeginSampling(SourcePawn::IPluginContext* targetCtx);
@@ -102,7 +103,7 @@ private:
   std::unique_ptr<SessionManager> session_manager_;
   std::unique_ptr<Profiler> vm_profiler_;      // all plugins (VM IProfilingTool)
   std::unique_ptr<Profiler> traced_profiler_;  // debugged plugin (debug-break tracer)
-  SourcePawn::ISourcePawnEngine2* spengine2_ = nullptr;
+  bool vm_profiling_ = false;
 
   // Tracing-profiler state. profiling_active_ + profiling_epoch_ are the only
   // cross-thread bits (TCP writes in Begin/EndSampling, VM reads in the break

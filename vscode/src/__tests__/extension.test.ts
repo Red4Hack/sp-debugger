@@ -37,6 +37,10 @@ describe("Extension", () => {
         "sp-debugger.debugActiveFile",
         expect.any(Function),
       );
+      expect(vscode.window.registerWebviewViewProvider).toHaveBeenCalledWith(
+        "spDebuggerPerformance",
+        expect.any(Object),
+      );
       // activate() also wires the profiler tree view + its commands, so the
       // subscription list is larger than just the three registrations above.
       expect(mockContext.subscriptions.length).toBeGreaterThanOrEqual(3);

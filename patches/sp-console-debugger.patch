@@ -1,5 +1,5 @@
 diff --git a/breakpoints.cpp b/breakpoints.cpp
-index 94d7c71..3c7205a 100644
+index 94d7c71..fdee4c8 100644
 --- a/breakpoints.cpp
 +++ b/breakpoints.cpp
 @@ -31,48 +31,154 @@
@@ -92,10 +92,11 @@ index 94d7c71..3c7205a 100644
    Breakpoint *bp;
    {
      ucell_t addr;
-+    bool was_snapped = false;
-     IPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
+-    IPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
 -    if (debuginfo->LookupLineAddress(line, file.c_str(), &addr) != SP_ERROR_NONE)
 -      return nullptr;
++    bool was_snapped = false;
++    SpPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
 +
 +    // The client (VS Code) sends an absolute local path, but the debug info
 +    // stores the path as seen by the compiler (e.g. "antibhop.sp" or
@@ -164,7 +165,7 @@ index 94d7c71..3c7205a 100644
  
      // See if there's already a breakpoint in place here.
      BreakpointMap::Insert p = breakpoint_map_.findForAdd(addr);
-@@ -92,9 +198,12 @@ BreakpointManager::AddBreakpoint(const std::string& file, cell_t line, bool temp
+@@ -92,16 +198,21 @@ BreakpointManager::AddBreakpoint(const std::string& file, cell_t line, bool temp
  Breakpoint *
  BreakpointManager::AddBreakpoint(const std::string& file, const std::string& function, bool temporary)
  {
@@ -177,9 +178,10 @@ index 94d7c71..3c7205a 100644
      return nullptr;
 +  std::string targetfile = found;
  
-   IPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
+-  IPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
++  SpPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
    // Is there a function named like that in the file?
-@@ -102,6 +211,8 @@ BreakpointManager::AddBreakpoint(const std::string& file, const std::string& fun
+   uint32_t addr;
    if (debuginfo->LookupFunctionAddress(function.c_str(), targetfile.c_str(), &addr) != SP_ERROR_NONE)
      return nullptr;
  
@@ -238,10 +240,12 @@ index 94d7c71..3c7205a 100644
    breakpoint_map_.clear();
  }
  
-@@ -172,6 +304,7 @@ BreakpointManager::FindBreakpoint(const std::string& input)
+@@ -171,7 +303,8 @@ BreakpointManager::FindBreakpoint(const std::string& input)
+   const char *fname;
    uint32_t line;
    uint32_t number = 0;
-   IPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
+-  IPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
++  SpPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
 +  std::lock_guard<std::mutex> lock(bp_mutex_);
    for (BreakpointMap::iterator iter = breakpoint_map_.iter(); !iter.empty(); iter.next()) {
      bp = iter->value;
@@ -255,18 +259,23 @@ index 94d7c71..3c7205a 100644
      bp = iter->value;
  
 diff --git a/breakpoints.h b/breakpoints.h
-index 3594b21..9ae26d9 100644
+index 3594b21..ac79ad8 100644
 --- a/breakpoints.h
 +++ b/breakpoints.h
-@@ -35,6 +35,7 @@
+@@ -33,8 +33,12 @@
+ #define _INCLUDE_DEBUGGER_BREAKPOINT_H
+ 
  #include <sp_vm_api.h>
++// IDebugSymbol & co. and SpPluginDebugInfo: the extension-side debug-info API
++// (stockvm/), so these build against the stock, unpatched SourcePawn headers.
++#include "plugin-debug-info.h"
  #include "amtl/am-hashmap.h"
  #include <string>
 +#include <mutex>
  #include "console-helpers.h"
  
  class Breakpoint;
-@@ -43,18 +44,45 @@ class Debugger;
+@@ -43,18 +47,45 @@ class Debugger;
  class BreakpointManager {
  public:
    BreakpointManager(Debugger* debugger) : debugger_(debugger) {}
@@ -313,7 +322,12 @@ index 3594b21..9ae26d9 100644
  public:
    struct BreakpointMapPolicy {
  
-@@ -77,7 +105,8 @@ public:
+@@ -73,11 +104,12 @@ public:
+ 
+ class Breakpoint {
+ public:
+-  Breakpoint(SourcePawn::IPluginDebugInfo *debuginfo, ucell_t addr, const char *name, bool temporary = false)
++  Breakpoint(SpPluginDebugInfo *debuginfo, ucell_t addr, const char *name, bool temporary = false)
      : debuginfo_(debuginfo),
      addr_(addr),
      name_(name),
@@ -323,7 +337,7 @@ index 3594b21..9ae26d9 100644
    {}
  
    ucell_t addr() {
-@@ -101,11 +130,30 @@ public:
+@@ -101,11 +133,30 @@ public:
        return line;
      return 0;
    }
@@ -343,7 +357,8 @@ index 3594b21..9ae26d9 100644
 +  int GetHitCount() const { return hit_count_; }
 +  
  private:
-   SourcePawn::IPluginDebugInfo * debuginfo_; /* debug info of plugin the address is in */
+-  SourcePawn::IPluginDebugInfo * debuginfo_; /* debug info of plugin the address is in */
++  SpPluginDebugInfo * debuginfo_; /* debug info of plugin the address is in */
    ucell_t addr_; /* address (in code or data segment) */
    const char *name_; /* name of the symbol (function) */
    bool temporary_; /* delete breakpoint when hit? */
@@ -355,7 +370,7 @@ index 3594b21..9ae26d9 100644
  
  #endif // _INCLUDE_DEBUGGER_BREAKPOINT_H
 diff --git a/commands.cpp b/commands.cpp
-index cd7e900..2482c05 100644
+index cd7e900..f6da3b7 100644
 --- a/commands.cpp
 +++ b/commands.cpp
 @@ -30,6 +30,7 @@
@@ -366,6 +381,42 @@ index cd7e900..2482c05 100644
  #include <iostream>
  #include <amtl/am-string.h>
  #include <smx/smx-legacy-debuginfo.h>
+@@ -81,7 +82,7 @@ BreakpointCommand::Accept(const std::string& command, const std::string& params)
+ 
+   bool isTemporary = !command.rfind("tb", 0);
+ 
+-  IPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
++  SpPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
+   Breakpoint *bp = nullptr;
+   // User specified a line number
+   if (isdigit(breakpoint_location[0])) {
+@@ -216,7 +217,7 @@ ContinueCommand::Accept(const std::string& command, const std::string& params) {
+     }
+ 
+     uint32_t bpline = 0;
+-    IPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
++    SpPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
+     debuginfo->LookupLine(bp->addr(), &bpline);
+     printf("Running until line %d in file %s.\n", bpline, SkipPath(filename.c_str()));
+   }
+@@ -390,7 +391,7 @@ ExamineMemoryCommand::Accept(const std::string& command, const std::string& para
+ 
+     // Stop when reading out of bounds.
+     // Get the data pointer we want to print.
+-    if (debugger_->ctx()->LocalToPhysAddr(address, &data) != SP_ERROR_NONE)
++    if (SpLocalToPhys(debugger_->ctx(), address, sizeof(cell_t), &data) != SP_ERROR_NONE)
+       break;
+ 
+     // Put |line_break| blocks in one line.
+@@ -450,7 +451,7 @@ CommandResult
+ FilesCommand::Accept(const std::string& command, const std::string& params) {
+   fputs("Source files:\n", stdout);
+   // Browse through the file table
+-  IPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
++  SpPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
+   for (unsigned int i = 0; i < debuginfo->NumFiles(); i++) {
+     if (debuginfo->GetFileName(i) != nullptr) {
+       printf("%s\n", debuginfo->GetFileName(i));
 @@ -459,36 +460,8 @@ FilesCommand::Accept(const std::string& command, const std::string& params) {
    return CR_StayCommandLoop;
  }
@@ -414,8 +465,52 @@ index cd7e900..2482c05 100644
    // Find correct new frame pointer.
    cell_t* ptr;
    for (uint32_t i = 1; i < num_scripted_frames; i++) {
+@@ -561,7 +534,7 @@ FrameCommand::Accept(const std::string& command, const std::string& params) {
+     frm = *ptr;
+   }
+ 
+-  IPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
++  SpPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
+   uint32_t line = 0;
+   debuginfo->LookupLine(cip, &line);
+   debugger_->SetCurrentLine(line);
+@@ -593,7 +566,7 @@ FunctionsCommand::Accept(const std::string& command, const std::string& params)
+ 
+   // Run through all functions with a name and 
+   // print it including the filename where it's defined.
+-  IPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
++  SpPluginDebugInfo *debuginfo = debugger_->GetDebugInfo();
+   const char *functionname;
+   const char *filename;
+   for (size_t i = 0; i < debuginfo->NumFunctions(); i++) {
+@@ -624,7 +597,11 @@ CommandResult
+ PrintVariableCommand::Accept(const std::string& command, const std::string& params) {
+   uint32_t idx[MAX_LEGACY_DIMENSIONS];
+   memset(idx, 0, sizeof(idx));
+-  IPluginDebugInfo *debuginfo = debugger_->ctx()->GetRuntime()->GetDebugInfo();
++  SpPluginDebugInfo *debuginfo = SpDebugInfo(debugger_->ctx()->GetRuntime());
++  if (!debuginfo) {
++    printf("Debug info unavailable for this plugin.\n");
++    return CR_StayCommandLoop;
++  }
+ 
+   IDebugSymbolIterator* symbol_iterator = debuginfo->CreateSymbolIterator(debugger_->cip());
+   if (params.empty() || params == "*") {
+@@ -696,7 +673,11 @@ QuitCommand::Accept(const std::string& command, const std::string& params) {
+ 
+ CommandResult
+ SetVariableCommand::Accept(const std::string& command, const std::string& params) {
+-  IPluginDebugInfo *debuginfo = debugger_->ctx()->GetRuntime()->GetDebugInfo();
++  SpPluginDebugInfo *debuginfo = SpDebugInfo(debugger_->ctx()->GetRuntime());
++  if (!debuginfo) {
++    printf("Debug info unavailable for this plugin.\n");
++    return CR_StayCommandLoop;
++  }
+   IDebugSymbolIterator* symbol_iterator = debuginfo->CreateSymbolIterator(debugger_->cip());
+ 
+   // TODO: Allow float assignments.
 diff --git a/debugger.cpp b/debugger.cpp
-index 987148d..aca503d 100644
+index 987148d..f63019e 100644
 --- a/debugger.cpp
 +++ b/debugger.cpp
 @@ -29,14 +29,25 @@
@@ -444,7 +539,7 @@ index 987148d..aca503d 100644
  
  using namespace SourcePawn;
  
-@@ -98,6 +109,7 @@ void
+@@ -98,24 +109,115 @@ void
  Debugger::Deactivate()
  {
    active_ = false;
@@ -452,10 +547,21 @@ index 987148d..aca503d 100644
  
    breakpoints_.ClearAllBreakpoints();
    symbols_.ClearAllWatches();
-@@ -110,12 +122,84 @@ Debugger::GetDebugInfo() const
-   return selected_context_->GetRuntime()->GetDebugInfo();
+   SetRunmode(RUNNING);
  }
  
+-SourcePawn::IPluginDebugInfo*
++SpPluginDebugInfo*
+ Debugger::GetDebugInfo() const
+ {
+-  return selected_context_->GetRuntime()->GetDebugInfo();
++  // Never null: a plugin whose .smx can't be read (not compiled with debug info,
++  // or a SourcePawn 2.0 binary) gets an empty one, so callers that dereference it
++  // without a check (breakpoints, commands) fail cleanly instead of crashing.
++  SpPluginDebugInfo *info = SpDebugInfo(selected_context_->GetRuntime());
++  return info ? info : SpPluginDebugInfo::Empty();
++}
++
 +bool
 +Debugger::SelectFrame(uint32_t frame_id)
 +{
@@ -509,6 +615,20 @@ index 987148d..aca503d 100644
 +  }
 +  context_->DestroyFrameIterator(frames);
 +
++  // SourcePawn 2.0 frames are virtual-register blocks, not a linked stack: the
++  // list captured at the stop already holds every frame's base.
++  if (SpPluginDebugInfo *info = SpDebugInfo(ctx->GetRuntime())) {
++    if (info->IsV2()) {
++      if (ctx != context_ || num_scripted_frames == 0 || num_scripted_frames > break_frames_.size())
++        return false;
++      // The innermost frame is at the line we stopped for, which on 2.0 can be a
++      // later line sharing the VM's instruction.
++      UpdateSelectedContext(ctx, frame_id, num_scripted_frames == 1 ? break_cip_ : cip,
++                            break_frames_[num_scripted_frames - 1]);
++      return true;
++    }
++  }
++
 +  // Follow the frame-pointer chain to the selected frame, starting at the frame
 +  // we actually stopped in. The debug-break hook hands us that frame pointer
 +  // (break_frm_), and it is the only value guaranteed to describe the currently
@@ -529,8 +649,8 @@ index 987148d..aca503d 100644
 +
 +  UpdateSelectedContext(ctx, frame_id, cip, frm);
 +  return true;
-+}
-+
+ }
+ 
  void
  Debugger::HandleInput(cell_t cip, cell_t frm, bool isBp)
  {
@@ -540,7 +660,7 @@ index 987148d..aca503d 100644
    static std::string lastcommand = "";
  
    // Reset the state.
-@@ -127,8 +211,11 @@ Debugger::HandleInput(cell_t cip, cell_t frm, bool isBp)
+@@ -127,8 +229,11 @@ Debugger::HandleInput(cell_t cip, cell_t frm, bool isBp)
    selected_context_ = context_;
    is_breakpoint_ = isBp;
  
@@ -553,7 +673,7 @@ index 987148d..aca503d 100644
    bool selected_first_scripted = false;
    for (; !frames->Done(); frames->Next(), frame_count_++) {
      if (frames->IsInternalFrame())
-@@ -142,42 +229,60 @@ Debugger::HandleInput(cell_t cip, cell_t frm, bool isBp)
+@@ -142,42 +247,60 @@ Debugger::HandleInput(cell_t cip, cell_t frm, bool isBp)
  
    context_->DestroyFrameIterator(frames);
  
@@ -624,7 +744,7 @@ index 987148d..aca503d 100644
        params = line.substr(pos + 1);
        params = trimString(params);
      }
-@@ -187,7 +292,6 @@ Debugger::HandleInput(cell_t cip, cell_t frm, bool isBp)
+@@ -187,7 +310,6 @@ Debugger::HandleInput(cell_t cip, cell_t frm, bool isBp)
        continue;
      }
  
@@ -632,7 +752,7 @@ index 987148d..aca503d 100644
      if (!stricmp(command.c_str(), "?") || !stricmp(command.c_str(), "help")) {
        ListCommands(params);
        continue;
-@@ -202,13 +306,8 @@ Debugger::HandleInput(cell_t cip, cell_t frm, bool isBp)
+@@ -202,13 +324,8 @@ Debugger::HandleInput(cell_t cip, cell_t frm, bool isBp)
      if (matched_cmd->Accept(command, params) == CR_LeaveCommandLoop) {
        return;
      }
@@ -647,7 +767,7 @@ index 987148d..aca503d 100644
  }
  
  std::shared_ptr<DebuggerCommand>
-@@ -248,6 +347,119 @@ Debugger::ResolveCommandString(const std::string command)
+@@ -248,6 +365,119 @@ Debugger::ResolveCommandString(const std::string command)
    return matched_cmds[0];
  }
  
@@ -767,8 +887,42 @@ index 987148d..aca503d 100644
  void
  Debugger::ListCommands(const std::string command)
  {
+@@ -356,18 +586,23 @@ Debugger::FindFileByPartialName(const std::string partialname)
+ {
+   // the user may have given a partial filename (e.g. without a path), so
+   // walk through all files to find a match.
+-  IPluginDebugInfo *debuginfo = context_->GetRuntime()->GetDebugInfo();
+-  size_t len = partialname.size();
+-  size_t offs;
+-  const char *filename;
++  SpPluginDebugInfo *debuginfo = SpDebugInfo(context_->GetRuntime());
++  if (!debuginfo)
++    return nullptr;
++
++  const size_t len = partialname.size();
+   for (uint32_t i = 0; i < debuginfo->NumFiles(); i++) {
+-    filename = debuginfo->GetFileName(i);
+-    offs = strlen(filename) - len;
+-    if (offs >= 0 &&
+-      !strncmp(filename + offs, partialname.c_str(), len))
+-    {
++    const char *filename = debuginfo->GetFileName(i);
++    if (!filename)
++      continue;
++    // Suffix match. `offs` is unsigned, so the old `strlen(filename) - len`
++    // wrapped around whenever the candidate was shorter than the needle and
++    // strncmp() then read far past the end of the string.
++    const size_t flen = strlen(filename);
++    if (flen < len)
++      continue;
++    if (!strncmp(filename + (flen - len), partialname.c_str(), len))
+       return filename;
+-    }
+   }
+   return nullptr;
+ }
 diff --git a/debugger.h b/debugger.h
-index e5f629a..8ce4e56 100644
+index e5f629a..59ebb6c 100644
 --- a/debugger.h
 +++ b/debugger.h
 @@ -34,12 +34,15 @@
@@ -791,6 +945,7 @@ index e5f629a..8ce4e56 100644
    }
    void Activate();
    void Deactivate();
+-  SourcePawn::IPluginDebugInfo* GetDebugInfo() const;
 +
 +  // Identifies the DAP client that owns the current debug session. Disconnect
 +  // cleanup is scoped to the owning client so that a late/stale disconnect from
@@ -799,7 +954,7 @@ index e5f629a..8ce4e56 100644
 +  // the ClientConnection definition into this header.
 +  void SetOwnerToken(const void* token) { owner_token_ = token; }
 +  const void* OwnerToken() const { return owner_token_; }
-   SourcePawn::IPluginDebugInfo* GetDebugInfo() const;
++  SpPluginDebugInfo* GetDebugInfo() const;
  
    void HandleInput(cell_t cip, cell_t frm, bool isBp);
    void ListCommands(const std::string command);
@@ -835,7 +990,19 @@ index e5f629a..8ce4e56 100644
    }
    cell_t lastframe() const {
      return lastfrm_;
-@@ -130,22 +160,56 @@ public:
+@@ -117,6 +147,11 @@ public:
+   cell_t frm() const {
+     return frm_;
+   }
++  // Address of the line the debugger stopped on (may differ from the VM view
++  // of the frame on SourcePawn 2.0, see OnDebugBreak).
++  cell_t breakcip() const {
++    return break_cip_;
++  }
+   SourcePawn::IPluginContext* basectx() const {
+     return context_;
+   }
+@@ -130,22 +165,61 @@ public:
      frm_ = frm;
    }
  
@@ -845,6 +1012,11 @@ index e5f629a..8ce4e56 100644
 +  // false when the frame can't be selected (e.g. a native frame). Frame 0 is
 +  // the stop location and is restored without touching VM internals.
 +  bool SelectFrame(uint32_t frame_id);
++
++  // SourcePawn 2.0: frame pointers (register bases) of the scripted frames of the
++  // stopped context, innermost first. Captured on the VM thread right before the
++  // stop, because they can only be found from that thread's stack.
++  void SetBreakFrames(std::vector<cell_t>&& frames) { break_frames_ = std::move(frames); }
 +
    void DumpStack();
    void PrintCurrentPosition();
@@ -894,7 +1066,7 @@ index e5f629a..8ce4e56 100644
    std::vector<std::shared_ptr<DebuggerCommand>> commands_;
    BreakpointManager breakpoints_;
    SymbolManager symbols_;
-@@ -156,6 +220,12 @@ private:
+@@ -156,6 +230,13 @@ private:
    uint32_t frame_count_;
    uint32_t selected_frame_;
    SourcePawn::IPluginContext *selected_context_;
@@ -904,14 +1076,15 @@ index e5f629a..8ce4e56 100644
 +  // internals.
 +  cell_t break_cip_ = 0;
 +  cell_t break_frm_ = 0;
++  std::vector<cell_t> break_frames_;
  };
  
  #endif // _INCLUDE_DEBUGGER_H
 diff --git a/extension.cpp b/extension.cpp
-index c425782..2003795 100644
+index c425782..70eba91 100644
 --- a/extension.cpp
 +++ b/extension.cpp
-@@ -31,12 +31,22 @@
+@@ -31,12 +31,32 @@
  
  #include <memory>
  #include <string>
@@ -926,15 +1099,25 @@ index c425782..2003795 100644
  #include "debugger.h"
  #include "console-helpers.h"
 +#include "dap-seam.h"
++#include "frame-utils.h"
++#include "plugin-debug-info.h"
++#include "vm-hooks.h"
  #include <amtl/am-platform.h>
  #include <amtl/os/am-shared-library.h>
 +#include <cstdio>
 +#include <cstdlib>
 +#include <cstring>
++#include <cstdint>
++#if !defined(KE_WINDOWS)
++#include <dlfcn.h>
++#endif
++#if defined(KE_WINDOWS)
++#include <windows.h>
++#endif
  #ifdef KE_POSIX
  #include <ctype.h>
  #endif
-@@ -50,14 +60,36 @@ using namespace ke;
+@@ -50,22 +70,40 @@ using namespace ke;
  
  ConsoleDebugger g_Debugger;		/**< Global singleton for extension's main interface */
  
@@ -953,6 +1136,8 @@ index c425782..2003795 100644
 -#if defined PLATFORM_X86
 -# define SOURCEPAWN_DLL "sourcepawn.jit.x86"
 -#else
+-# define SOURCEPAWN_DLL "sourcepawn.vm"
+-#endif
 +// The verbose-logging flag lives in configs/console-debugger.cfg alongside the
 +// DAP settings, so it is read through the crate's config parser (dap-seam.h)
 +// rather than a second scanner maintained here.
@@ -960,83 +1145,64 @@ index c425782..2003795 100644
 +{
 +    return dap::ConfigFlag("debug_log", false);
 +}
-+
-+// Pick the VM library basename by architecture. NOTE: SourceMod's PLATFORM_X86
-+// macro is NOT reliably defined in this build, so a 32-bit (x86) build wrongly
-+// fell through to "sourcepawn.vm" and failed to open the VM (the 32-bit VM is
-+// "sourcepawn.jit.x86"). Detect the bitness from the compiler instead:
-+//   64-bit -> sourcepawn.vm          (in bin/x64/)
-+//   32-bit -> sourcepawn.jit.x86     (in bin/)
-+#if defined(__x86_64__) || defined(_M_X64) || defined(__amd64__) || defined(__aarch64__)
- # define SOURCEPAWN_DLL "sourcepawn.vm"
-+#else
-+# define SOURCEPAWN_DLL "sourcepawn.jit.x86"
- #endif
  
  bool
-@@ -75,27 +107,49 @@ ConsoleDebugger::SDK_OnLoad(char *error, size_t maxlength, bool late)
+ ConsoleDebugger::SDK_OnLoad(char *error, size_t maxlength, bool late)
+ {
+-  if (smutils->GetScriptingEngine()->GetEngineAPIVersion() < 5)
++  // Load the verbose-logging flag first so the VM-hook diagnostics below can
++  // be gated by it. Opt in with `"debug_log" "1"`.
++  g_DebugLogging = LoadDebugLoggingFlag();
++
++  // Reach the debug-break / profiling hooks of the STOCK SourcePawn VM this
++  // SourceMod runs -- public API on 1.12, sp::Environment via logic.so's symbol
++  // table on 1.13+ (stockvm/vm-hooks.cpp). No virtual call is made on the
++  // engine before its layout has been validated there. No patched VM needed.
++  if (!spdbg::vm::Init(late, error, maxlength))
+   {
+-    ke::SafeStrcpy(error, maxlength, "This SourcePawn VM doesn't support line debugging. Please update SourceMod.");
++    smutils->LogMessage(myself, "[debug-init] FAILED: %s", error);
+     return false;
+   }
+ 
+@@ -75,66 +113,93 @@ ConsoleDebugger::SDK_OnLoad(char *error, size_t maxlength, bool late)
      return false;
    }
  
 -  if (!late)
-+  // Load the verbose-logging flag early (before the profiler-init block below)
-+  // so its diagnostics can be gated by it. Opt in with `"debug_log" "1"`.
-+  g_DebugLogging = LoadDebugLoggingFlag();
-+
-+  // The v2 SourcePawn engine, captured below and handed to the DAP layer so its
-+  // "All plugins" profiler can register a profiling tool. Null if unavailable.
-+  SourcePawn::ISourcePawnEngine2* spengine2 = nullptr;
-+
++  if (!spdbg::vm::InstallDebugBreakHandler(OnDebugBreak))
    {
 -    // Try to enable line debugging support in the VM until https://github.com/alliedmodders/sourcemod/pull/2240 is merged.
 -    // This is a hack to get the SourcePawn VM factory function.
-+    // Grab the SourcePawn VM environment via the factory function. We use it for
-+    // two things: enabling line-debugging (EnableDebugBreak -- only safe non-late,
-+    // before plugins load) and capturing the v2 engine (spengine2), which the
-+    // "All plugins" profiler uses (SetProfilingTool + EnableProfiling).
-     // https://github.com/Garey27/sm-debugger/blob/3c01bf6cede2bb7ddeffb24d0f35d87c4538e039/src/extension.cpp#L127
-     char file[PLATFORM_MAX_PATH];
-     smutils->BuildPath(Path_SM, file, sizeof(file), "bin/" PLATFORM_ARCH_FOLDER SOURCEPAWN_DLL ".%s", PLATFORM_LIB_EXT);
-+    if (g_DebugLogging)
-+      smutils->LogMessage(myself, "[debug-init] opening VM library: %s", file);
-     auto module = ke::SharedLib::Open(file);
+-    // https://github.com/Garey27/sm-debugger/blob/3c01bf6cede2bb7ddeffb24d0f35d87c4538e039/src/extension.cpp#L127
+-    char file[PLATFORM_MAX_PATH];
+-    smutils->BuildPath(Path_SM, file, sizeof(file), "bin/" PLATFORM_ARCH_FOLDER SOURCEPAWN_DLL ".%s", PLATFORM_LIB_EXT);
+-    auto module = ke::SharedLib::Open(file);
 -    if (module != nullptr)
 -    {
-+    if (module == nullptr) {
-+      smutils->LogMessage(myself, "[debug-init] FAILED: could not open VM library at %s", file);
-+    } else {
-       GetSourcePawnFactoryFn factoryFn = module->get<decltype(factoryFn)>("GetSourcePawnFactory");
+-      GetSourcePawnFactoryFn factoryFn = module->get<decltype(factoryFn)>("GetSourcePawnFactory");
 -      if (factoryFn)
 -      {
-+      if (!factoryFn) {
-+        smutils->LogMessage(myself, "[debug-init] FAILED: GetSourcePawnFactory symbol not found");
-+      } else {
-         const int LOWEST_SOURCEPAWN_API_VERSION = 0x0207;
-         ISourcePawnFactory *factory = factoryFn(LOWEST_SOURCEPAWN_API_VERSION);
+-        const int LOWEST_SOURCEPAWN_API_VERSION = 0x0207;
+-        ISourcePawnFactory *factory = factoryFn(LOWEST_SOURCEPAWN_API_VERSION);
 -        if (factory)
 -        {
-+        if (!factory) {
-+          smutils->LogMessage(myself, "[debug-init] FAILED: factory(0x%x) returned null (VM API too old?)", LOWEST_SOURCEPAWN_API_VERSION);
-+        } else {
-           ISourcePawnEnvironment *current_env = factory->CurrentEnvironment();
+-          ISourcePawnEnvironment *current_env = factory->CurrentEnvironment();
 -          if (current_env)
 -          {
 -            current_env->EnableDebugBreak();
-+          if (!current_env) {
-+            smutils->LogMessage(myself, "[debug-init] FAILED: CurrentEnvironment() null");
-+          } else {
-+            spengine2 = current_env->APIv2();
-+            if (g_DebugLogging)
-+              smutils->LogMessage(myself, "[debug-init] env=%p apiVersion=%d APIv2()=%p",
-+                                  (void*)current_env, current_env->ApiVersion(), (void*)spengine2);
-+            // Line debugging may only be (re)enabled when loaded non-late, or
-+            // already-loaded plugins won't be debuggable. See the deploy note.
-+            if (!late)
-+              current_env->EnableDebugBreak();
-           }
-         }
-       }
-@@ -110,26 +164,71 @@ ConsoleDebugger::SDK_OnLoad(char *error, size_t maxlength, bool late)
+-          }
+-        }
+-      }
+-    }
+-  }
+-
+-  if (smutils->GetScriptingEngine()->SetDebugBreakHandler(OnDebugBreak) != SP_ERROR_NONE)
+-  {
+-    ke::SafeStrcpy(error, maxlength, "Failed to install debugger in the SourcePawn VM. Enable line debugging support in SourceMod's core.cfg. The extension can't be late loaded after any plugins were already loaded.");
++    ke::SafeStrcpy(error, maxlength, "Failed to install debugger in the SourcePawn VM: line debugging is off. On SourceMod 1.13+ set \"EnableLineDebugging\" \"yes\" in core.cfg; on any version the extension must load at server start, not late.");
+     return false;
+   }
  
    plsys->AddPluginsListener(this);
  
@@ -1063,9 +1229,11 @@ index c425782..2003795 100644
 +
    rootconsole->AddRootConsoleCommand3("debug", "Debug Plugins", this);
  
++  smutils->LogMessage(myself, "SourcePawn debugger attached: %s", spdbg::vm::Backend());
++
 +  // Hand off to the DAP crate: it starts the TCP/DAP server and the profilers.
 +  // Everything VS-Code-specific lives behind dap/dap-seam.h.
-+  dap::Init(this, spengine2);
++  dap::Init(this, spdbg::vm::ProfilingAvailable());
 +
    return true;
  }
@@ -1082,8 +1250,10 @@ index c425782..2003795 100644
 +  // crashes the server. The only way to detach is to null the handler.
 +  // InvokeDebugger() null-checks it (vm/debugging.cpp), so this is safe and is
 +  // what makes `sm exts unload`/reload survivable.
-+  if (smutils->GetScriptingEngine())
-+    smutils->GetScriptingEngine()->SetDebugBreakHandler(nullptr);
++  // Only touch the handler if SDK_OnLoad got far enough to install one: on a VM
++  // without debug-break support the call itself is what crashes.
++  spdbg::vm::RemoveDebugBreakHandler();
++  spdbg::vm::Shutdown();
 +
 +  // Tear down the DAP crate: stops the TCP server and destroys the profilers.
 +  dap::Shutdown();
@@ -1113,10 +1283,20 @@ index c425782..2003795 100644
    }
 -  delete pliter;
 +  debugger_map_.clear();
++  SpDebugInfoReleaseAll();
  }
  
  void
-@@ -153,11 +252,19 @@ ConsoleDebugger::OnPluginLoaded(IPlugin *plugin)
+ ConsoleDebugger::OnPluginLoaded(IPlugin *plugin)
+ {
++  // Snapshot the plugin's debug info now, while the .smx on disk is the binary
++  // the VM just loaded (a later recompile must not desync line numbers).
++  SpDebugInfoPreload(plugin->GetRuntime());
++
+   // Create a debugger object for this plugin.
+   Debugger *debugger = new Debugger(plugin->GetBaseContext());
+   if (!debugger->Initialize()) {
+@@ -153,18 +218,29 @@ ConsoleDebugger::OnPluginLoaded(IPlugin *plugin)
      debugger->Activate();
      debugger->SetRunmode(STEPPING);
    }
@@ -1135,8 +1315,51 @@ index c425782..2003795 100644
 +
    // Cleanup after the plugin.
    DebuggerMap::Result r = debugger_map_.find(plugin->GetBaseContext());
-   if (!r.found())
-@@ -389,6 +496,12 @@ OnDebugBreak(IPluginContext *ctx, sp_debug_break_info_t& dbginfo, const SourcePa
+-  if (!r.found())
+-    return;
++  if (r.found()) {
++    delete r->value;
++    debugger_map_.remove(r);
++  }
+ 
+-  delete r->value;
+-  debugger_map_.remove(r);
++  // Breakpoints held pointers into this; drop it only after the debugger.
++  SpDebugInfoRelease(plugin->GetRuntime());
++  spdbg::vm::ForgetV2Lines();
+ }
+ 
+ void
+@@ -267,8 +343,8 @@ ConsoleDebugger::OnRootConsoleCommand(const char *cmdname, const ICommandArgs *a
+       // User didn't specify a filename. 
+       // Use the main source file by default (last one in the list).
+       if (filename.empty()) {
+-        IPluginDebugInfo *debuginfo = pl->GetRuntime()->GetDebugInfo();
+-        if (debuginfo->NumFiles() <= 0)
++        SpPluginDebugInfo *debuginfo = SpDebugInfo(pl->GetRuntime());
++        if (!debuginfo || debuginfo->NumFiles() <= 0)
+           return;
+         filename = debuginfo->GetFileName(debuginfo->NumFiles() - 1);
+       }
+@@ -363,6 +439,12 @@ ConsoleDebugger::StartPluginDebugging(IPluginContext *ctx)
+   if (ctx->GetRuntime()->IsPaused())
+     return false;
+ 
++  // SourcePawn 2.0 plugins only reach the debugger from the interpreter.
++  if (SpPluginDebugInfo *info = SpDebugInfo(ctx->GetRuntime())) {
++    if (info->IsV2())
++      spdbg::vm::RequireInterpreter(true);
++  }
++
+   debugger->Activate();
+   debugger->SetRunmode(STEPPING);
+ 
+@@ -385,10 +467,16 @@ OnDebugBreak(IPluginContext *ctx, sp_debug_break_info_t& dbginfo, const SourcePa
+   // Make sure we know how to interpret the data.
+   if (dbginfo.version > DEBUG_BREAK_INFO_VERSION) {
+     smutils->LogError(myself, "VM is too new. Debug context version is %x (only support up to %x).", dbginfo.version, DEBUG_BREAK_INFO_VERSION);
+-    smutils->GetScriptingEngine()->SetDebugBreakHandler(nullptr);
++    spdbg::vm::RemoveDebugBreakHandler();
      return;
    }
  
@@ -1149,7 +1372,44 @@ index c425782..2003795 100644
    // Try to get the debugger instance for this plugin.
    Debugger *debugger = g_Debugger.GetPluginDebugger(ctx);
    if (!debugger)
-@@ -403,10 +516,27 @@ OnDebugBreak(IPluginContext *ctx, sp_debug_break_info_t& dbginfo, const SourcePa
+@@ -398,15 +486,63 @@ OnDebugBreak(IPluginContext *ctx, sp_debug_break_info_t& dbginfo, const SourcePa
+   if (!debugger->active())
+     return;
+ 
+-  IPluginDebugInfo *debuginfo = ctx->GetRuntime()->GetDebugInfo();
++  SpPluginDebugInfo *debuginfo = SpDebugInfo(ctx->GetRuntime());
++  if (!debuginfo)
++    return;
+   bool isBreakpoint = false;
++  // Source-line addresses that start at this instruction (SourcePawn 2.0 can
++  // have several); breakpoints are checked against each of them.
++  std::vector<cell_t> line_candidates;
++
++#if defined(SPDBG_MERGED_ENV_API)
++  // SourcePawn 2.0 (SourceMod 1.13) leaves dbginfo.frm at 0 -- the frame lives in
++  // the runtime -- and reports only the first of the source lines that start at
++  // an instruction. V2CurrentPosition() recovers both. Only done for plugins
++  // being debugged: it scans the VM thread's stack.
++  if (debuginfo->IsV2()) {
++    spdbg::vm::V2Position pos;
++    if (spdbg::vm::V2CurrentPosition(ctx->GetRuntime(), debuginfo, &pos)) {
++      dbginfo.frm = pos.frm;
++      if (!report && pos.mapped) {
++        // A later instruction of a group whose lines were all reported (and
++        // checked for breakpoints) at the group's first instruction.
++        if (!pos.exact && pos.known)
++          return;
++        if (pos.exact && !pos.lines.empty()) {
++          dbginfo.cip = static_cast<cell_t>(pos.lines[0]);
++          for (uint32_t at : pos.lines)
++            line_candidates.push_back(static_cast<cell_t>(at));
++        }
++      }
++    }
++  }
++  if (dbginfo.frm == 0)
++    dbginfo.frm = sp::ReadContextFramePointer(ctx);
++#endif
  
    // Was there an exception instead of a dbreak instruction?
    if (report) {
@@ -1181,7 +1441,21 @@ index c425782..2003795 100644
    }
    else {
      // When running until the function returns, 
-@@ -426,9 +556,17 @@ OnDebugBreak(IPluginContext *ctx, sp_debug_break_info_t& dbginfo, const SourcePa
+@@ -414,8 +550,12 @@ OnDebugBreak(IPluginContext *ctx, sp_debug_break_info_t& dbginfo, const SourcePa
+     // the saved one from the function.
+     // If the current one is higher than the saved one,
+     // we're in a caller, so start stepping again!
++    // The 1.x stack grows down (a caller has the HIGHER frame); SourcePawn 2.0
++    // frames are allocated upwards (a caller has the LOWER one).
++    const bool frames_grow_up = debuginfo->IsV2();
+     if (debugger->runmode() == Runmode::STEPOUT &&
+-      dbginfo.frm > debugger->lastframe())
++      (frames_grow_up ? dbginfo.frm < debugger->lastframe()
++                      : dbginfo.frm > debugger->lastframe()))
+     {
+       debugger->SetRunmode(Runmode::STEPPING);
+     }
+@@ -426,9 +566,24 @@ OnDebugBreak(IPluginContext *ctx, sp_debug_break_info_t& dbginfo, const SourcePa
      if (debugger->runmode() != Runmode::STEPPING &&
        debugger->runmode() != Runmode::STEPOVER)
      {
@@ -1191,19 +1465,49 @@ index c425782..2003795 100644
 +      // Check breakpoint address (evaluates condition / hit count if set).
 +      // A logpoint fills log_message and returns false: we log and keep running
 +      // (no server freeze).
-+      std::string log_message;
-+      isBreakpoint = debugger->breakpoints().CheckBreakpoint(dbginfo.cip, dbginfo.frm, debugger, &log_message);
-+
-+      if (!log_message.empty()) {
-+        dap::SendOutput((log_message + "\n").c_str(), "console");
++      if (line_candidates.empty())
++        line_candidates.push_back(dbginfo.cip);
++      for (cell_t at : line_candidates) {
++        std::string log_message;
++        if (debugger->breakpoints().CheckBreakpoint(at, dbginfo.frm, debugger, &log_message)) {
++          isBreakpoint = true;
++          dbginfo.cip = at; // stop on the line that has the breakpoint
++        }
++        if (!log_message.empty())
++          dap::SendOutput((log_message + "\n").c_str(), "console");
++        if (isBreakpoint)
++          break;
 +      }
 +
 +      // Continue execution normally (also the logpoint path).
        if (!isBreakpoint)
          return;
  
-@@ -473,6 +611,10 @@ OnDebugBreak(IPluginContext *ctx, sp_debug_break_info_t& dbginfo, const SourcePa
+@@ -442,7 +597,8 @@ OnDebugBreak(IPluginContext *ctx, sp_debug_break_info_t& dbginfo, const SourcePa
+     if (debugger->runmode() == Runmode::STEPOVER) {
+       assert(debugger->lastframe() != 0);
+       // If we're in a lower frame, just execute the code.
+-      if (dbginfo.frm < debugger->lastframe())
++      if (frames_grow_up ? dbginfo.frm > debugger->lastframe()
++                         : dbginfo.frm < debugger->lastframe())
+         return;
+     }
+   }
+@@ -471,8 +627,23 @@ OnDebugBreak(IPluginContext *ctx, sp_debug_break_info_t& dbginfo, const SourcePa
+   unsigned int oldtimeout = DisableEngineWatchdog();
+ 
    // Start the debugger shell and wait for commands.
++#if defined(SPDBG_MERGED_ENV_API)
++  {
++    // The DAP thread resolves locals of any selected frame later, but the frame
++    // list can only be read from this thread's stack, so capture it now.
++    std::vector<cell_t> frames;
++    if (debuginfo->IsV2())
++      spdbg::vm::InterpreterFrames(ctx->GetRuntime(), true, &frames);
++    debugger->SetBreakFrames(std::move(frames));
++  }
++#endif
++
    debugger->HandleInput(dbginfo.cip, dbginfo.frm, isBreakpoint);
  
 +  // The exception (if any) has now been reported to the client; don't let it
@@ -1214,10 +1518,10 @@ index c425782..2003795 100644
    ResetEngineWatchdog(oldtimeout);
  
 diff --git a/extension.h b/extension.h
-index 85f4d0e..c9ebfce 100644
+index 85f4d0e..0da2079 100644
 --- a/extension.h
 +++ b/extension.h
-@@ -43,6 +43,12 @@
+@@ -43,6 +43,16 @@
  class Debugger;
  typedef ke::HashMap<IPluginContext *, Debugger *, ke::PointerPolicy<IPluginContext>> DebuggerMap;
  
@@ -1225,12 +1529,16 @@ index 85f4d0e..c9ebfce 100644
 +// the cfg "debug_log" key, default off). Use SPDBG_LOG(...) for [SM] DAP-style
 +// printf diagnostics; errors and one-time banners should print unconditionally.
 +extern bool g_DebugLogging;
++
++// Debug info parsed from the plugin's .smx by the extension (stock VM; see
++// stockvm/plugin-debug-info.h).
++#include "plugin-debug-info.h"
 +#define SPDBG_LOG(...) do { if (g_DebugLogging) rootconsole->ConsolePrint(__VA_ARGS__); } while (0)
 +
  /**
   * @brief Sample implementation of the SDK Extension.
   * Note: Uncomment one of the pre-defined virtual functions in order to use it.
-@@ -129,10 +135,11 @@ public:
+@@ -129,10 +139,11 @@ public:
  
  public:
    Debugger *GetPluginDebugger(IPluginContext *ctx);
@@ -1247,10 +1555,10 @@ index 85f4d0e..c9ebfce 100644
    bool debug_next_plugin_ = false;
 diff --git a/frame-utils.h b/frame-utils.h
 new file mode 100644
-index 0000000..eace8f4
+index 0000000..9192175
 --- /dev/null
 +++ b/frame-utils.h
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,101 @@
 +/**
 +* vim: set ts=4 :
 +* =============================================================================
@@ -1271,6 +1579,8 @@ index 0000000..eace8f4
 +#define _INCLUDE_DEBUGGER_FRAME_UTILS_H
 +
 +#include <sp_vm_api.h>
++#include "plugin-debug-info.h"
++#include "vm-hooks.h"
 +#include <memory>
 +#include <cstdint>
 +
@@ -1290,7 +1600,12 @@ index 0000000..eace8f4
 +  virtual bool done() const = 0;
 +  virtual void next() = 0;
 +  virtual int type() const = 0;
++#if !defined(SPDBG_MERGED_ENV_API)
++  // SourceMod 1.12 (and the old patched VM) have this slot; SourcePawn 2.0
++  // (SourceMod 1.13) does not -- declaring it there would shift cip() onto
++  // native_index() in the vtable.
 +  virtual cell_t function_cip() const = 0;
++#endif
 +  virtual cell_t cip() const = 0;
 +  virtual uint32_t native_index() const = 0;
 +};
@@ -1311,18 +1626,67 @@ index 0000000..eace8f4
 +// TODO: Properly expose this from the VM :D
 +inline cell_t ReadContextFramePointer(SourcePawn::IPluginContext* ctx)
 +{
++#if defined(SPDBG_MERGED_ENV_API)
++  // SourcePawn 2.0 merged IPluginContext into the runtime, so the old offset
++  // into BaseContext is gone and GetLocalParams() is no longer public. Only
++  // legacy (v1) plugins have debug info we can read, so a plugin with none is
++  // either v2 or unreadable and there is no frame to recover.
++  SpPluginDebugInfo* info = SpDebugInfo(ctx->GetRuntime());
++  if (!info)
++    return 0;
++  if (info->IsV2()) {
++    // SourcePawn 2.0 plugin: registers live in the plugin heap; the interpreter
++    // that owns them is found on this (VM) thread's stack.
++    std::vector<cell_t> frames;
++    if (!spdbg::vm::InterpreterFrames(ctx->GetRuntime(), false, &frames) || frames.empty())
++      return 0;
++    return frames[0];
++  }
++
++  // LocalParams() is frm + 2 cells as a host pointer; local address 0 is the
++  // plugin's memory base, so the difference is frm.
++  cell_t* params = spdbg::vm::LocalParams(ctx->GetRuntime());
++  cell_t* base = nullptr;
++  if (!params || ctx->LocalToPhysAddr(0, &base) != SP_ERROR_NONE || !base)
++    return 0;
++  return cell_t(reinterpret_cast<uintptr_t>(params) - reinterpret_cast<uintptr_t>(base)) -
++         cell_t(2 * sizeof(cell_t));
++#else
 +  return *(cell_t*)(uintptr_t(ctx) + sizeof(void*) * 10 + sizeof(bool) * 4 +
 +                    sizeof(uint32_t) * 2 + sizeof(cell_t) * 3);
++#endif
 +}
 +
 +} // namespace sp
 +
 +#endif // _INCLUDE_DEBUGGER_FRAME_UTILS_H
 diff --git a/symbols.cpp b/symbols.cpp
-index 1af30d8..3828151 100644
+index 1af30d8..57dc688 100644
 --- a/symbols.cpp
 +++ b/symbols.cpp
-@@ -157,8 +157,13 @@ SymbolWrapper::DisplayVariable(uint32_t index[], uint32_t idxlevel)
+@@ -45,7 +45,9 @@ SymbolManager::FindDebugSymbol(const std::string& name, cell_t scopeaddr, Source
+   cell_t codestart = 0, codeend = 0;
+   const SourcePawn::IDebugSymbol* matching_symbol = nullptr;
+ 
+-  SourcePawn::IPluginDebugInfo *debuginfo = debugger_->ctx()->GetRuntime()->GetDebugInfo();
++  SpPluginDebugInfo *debuginfo = SpDebugInfo(debugger_->ctx()->GetRuntime());
++  if (!debuginfo)
++    return nullptr;
+   while (!symbol_iterator->Done()) {
+     const SourcePawn::IDebugSymbol* sym = nullptr;
+     while (!symbol_iterator->Done()) {
+@@ -116,7 +118,9 @@ SymbolManager::ClearAllWatches()
+ void
+ SymbolManager::ListWatches()
+ {
+-  SourcePawn::IPluginDebugInfo *debuginfo = debugger_->ctx()->GetRuntime()->GetDebugInfo();
++  SpPluginDebugInfo *debuginfo = SpDebugInfo(debugger_->ctx()->GetRuntime());
++  if (!debuginfo)
++    return;
+   SourcePawn::IDebugSymbolIterator* symbol_iterator = debuginfo->CreateSymbolIterator(debugger_->cip());
+ 
+   uint32_t num = 1;
+@@ -157,8 +161,13 @@ SymbolWrapper::DisplayVariable(uint32_t index[], uint32_t idxlevel)
  {
    assert(index != nullptr);
  
@@ -1338,7 +1702,7 @@ index 1af30d8..3828151 100644
      fputs("(not in scope)", stdout);
      return;
    }
-@@ -269,35 +274,40 @@ SymbolWrapper::DisplayVariable(uint32_t index[], uint32_t idxlevel)
+@@ -269,35 +278,40 @@ SymbolWrapper::DisplayVariable(uint32_t index[], uint32_t idxlevel)
  void
  SymbolWrapper::PrintValue(const SourcePawn::ISymbolType* type, long value)
  {
@@ -1382,12 +1746,12 @@ index 1af30d8..3828151 100644
 +      snprintf(buffer, sizeof(buffer), "'\\x%02lx'", (long)value);
      else
 -      printf("'%c'", (char)value);
+-  }
+-  else {
+-    printf("%ld", value);
 +      snprintf(buffer, sizeof(buffer), "'%c'", (char)value);
 +    return buffer;
    }
--  else {
--    printf("%ld", value);
--  }
 -  /*case DISP_HEX:
 -    printf("%lx", value);
 -    break;*/
@@ -1396,7 +1760,7 @@ index 1af30d8..3828151 100644
  }
  
  const char *
-@@ -311,7 +321,7 @@ SymbolWrapper::ScopeToString()
+@@ -311,7 +325,7 @@ SymbolWrapper::ScopeToString()
  }
  
  bool
@@ -1405,7 +1769,25 @@ index 1af30d8..3828151 100644
  {
    // Tried to index a non-array.
    if (index > 0 && !symbol_->type()->isArray())
-@@ -372,7 +382,7 @@ SymbolWrapper::SetSymbolValue(uint32_t index, cell_t value)
+@@ -332,7 +346,7 @@ SymbolWrapper::GetSymbolValue(uint32_t index, cell_t* value)
+ 
+   // Resolve index into array.
+   cell_t *vptr;
+-  if (debugger_->ctx()->LocalToPhysAddr(addr + index * element_size, &vptr) != SP_ERROR_NONE)
++  if (SpLocalToPhys(debugger_->ctx(), addr + index * element_size, sizeof(cell_t), &vptr) != SP_ERROR_NONE)
+     return false;
+ 
+   if (vptr != nullptr) {
+@@ -362,7 +376,7 @@ SymbolWrapper::SetSymbolValue(uint32_t index, cell_t value)
+ 
+   // Resolve index into array.
+   cell_t *vptr;
+-  if (debugger_->ctx()->LocalToPhysAddr(addr + index * sizeof(cell_t), &vptr) != SP_ERROR_NONE)
++  if (SpLocalToPhys(debugger_->ctx(), addr + index * sizeof(cell_t), sizeof(cell_t), &vptr) != SP_ERROR_NONE)
+     return false;
+ 
+   if (vptr != nullptr)
+@@ -372,7 +386,7 @@ SymbolWrapper::SetSymbolValue(uint32_t index, cell_t value)
  }
  
  const char*
@@ -1414,35 +1796,128 @@ index 1af30d8..3828151 100644
  {
    // Make sure we're dealing with a one-dimensional array.
    if (!symbol_->type()->isArray() || symbol_->type()->dimcount() != 1)
-@@ -403,17 +413,21 @@ SymbolWrapper::SetSymbolString(const char* value)
+@@ -383,6 +397,8 @@ SymbolWrapper::GetSymbolString()
+     return nullptr;
+ 
+   char *str;
++  if (SpLocalToPhys(debugger_->ctx(), addr, 1, nullptr) != SP_ERROR_NONE)
++    return nullptr;
+   if (debugger_->ctx()->LocalToStringNULL(addr, &str) != SP_ERROR_NONE)
+     return nullptr;
+   return str;
+@@ -399,21 +415,105 @@ SymbolWrapper::SetSymbolString(const char* value)
+   if (!GetEffectiveSymbolAddress(&addr))
+     return false;
+ 
++  if (SpLocalToPhys(debugger_->ctx(), addr, 1, nullptr) != SP_ERROR_NONE)
++    return false;
+   return debugger_->ctx()->StringToLocalUTF8(addr, symbol_->type()->dimension(0), value, NULL) == SP_ERROR_NONE;
  }
  
++#if defined(SPDBG_MERGED_ENV_API)
++// SourcePawn 2.0 plugin: locals/args are virtual registers at frm + byte offset,
++// globals sit in the global buffer. Flat arrays and enum structs declared as
++// locals/globals are stored inline; arguments and multi-dimensional arrays hold
++// a heap handle that has to be resolved through the runtime.
++static bool
++ResolveSymbolAddressV2(SourcePawn::IPluginContext *ctx, cell_t frm, SpPluginDebugInfo *info,
++                       const SourcePawn::IDebugSymbol *symbol, cell_t *address)
++{
++  SourcePawn::IPluginRuntime *rt = ctx->GetRuntime();
++  const SourcePawn::ISymbolType *type = symbol->type();
++  const bool global = symbol->scope() == SourcePawn::Global || symbol->scope() == SourcePawn::Static;
++
++  cell_t base = symbol->address();
++  if (global) {
++    cell_t gbase;
++    if (!info->GlobalBase(rt, &gbase))
++      return false;
++    base += gbase;
++  } else {
++    base += frm;
++  }
++
++  cell_t *cell;
++  if (type->isEnumStruct()) {
++    // Passed by address; inline otherwise.
++    if (symbol->scope() == SourcePawn::Argument) {
++      if (SpLocalToPhys(ctx, base, sizeof(cell_t), &cell) != SP_ERROR_NONE || !cell)
++        return false;
++      base = *cell;
++    }
++  } else if (type->isArray()) {
++    const bool inline_array = type->dimcount() == 1 && symbol->scope() != SourcePawn::Argument;
++    if (!inline_array) {
++      if (SpLocalToPhys(ctx, base, sizeof(cell_t), &cell) != SP_ERROR_NONE || !cell || *cell <= 0)
++        return false;
++      // The VM reads the SpArray header at this address without checking it.
++      cell_t *header;
++      if ((*cell & 3) != 0 ||
++          SpLocalToPhys(ctx, *cell, 3 * sizeof(void*), &header) != SP_ERROR_NONE)
++        return false;
++      SourcePawn::ARRAY_PTR ptr;
++      if (rt->LocalToArrayPtr(*cell, &ptr) != SP_ERROR_NONE)
++        return false;
++      uint32_t size = 0;
++      void *data = rt->GetArrayData(ptr, &size);
++      cell_t *zero = nullptr;
++      if (!data || rt->LocalToPhysAddr(0, &zero) != SP_ERROR_NONE || !zero || !SpReadable(data, sizeof(cell_t)))
++        return false;
++      base = (cell_t)(reinterpret_cast<uint8_t *>(data) - reinterpret_cast<uint8_t *>(zero));
++    }
++  } else if (type->isReference()) {
++    if (SpLocalToPhys(ctx, base, sizeof(cell_t), &cell) != SP_ERROR_NONE || !cell)
++      return false;
++    base = *cell;
++  }
++
++  *address = base;
++  return true;
++}
++#endif
++
  bool
 -SymbolWrapper::GetEffectiveSymbolAddress(cell_t *address)
 +sp::ResolveSymbolAddress(Debugger *debugger, const SourcePawn::IDebugSymbol *symbol,
 +                         cell_t *address)
  {
 -  cell_t base = symbol_->address();
-+  if (!debugger || !symbol || !symbol->type() || !address)
++  if (!debugger)
 +    return false;
++  return sp::ResolveSymbolAddress(debugger->ctx(), debugger->frm(), symbol, address);
++}
++
++bool
++sp::ResolveSymbolAddress(SourcePawn::IPluginContext *ctx, cell_t frm,
++                         const SourcePawn::IDebugSymbol *symbol, cell_t *address)
++{
++  if (!ctx || !symbol || !symbol->type() || !address)
++    return false;
++
++#if defined(SPDBG_MERGED_ENV_API)
++  if (SpPluginDebugInfo *info = SpDebugInfo(ctx->GetRuntime())) {
++    if (info->IsV2())
++      return ResolveSymbolAddressV2(ctx, frm, info, symbol, address);
++  }
++#endif
 +
 +  cell_t base = symbol->address();
    // addresses of local vars are relative to the frame
 -  if (symbol_->scope() == SourcePawn::Local || symbol_->scope() == SourcePawn::Argument)
 -    base += debugger_->frm();
 +  if (symbol->scope() == SourcePawn::Local || symbol->scope() == SourcePawn::Argument)
-+    base += debugger->frm();
++    base += frm;
  
    // a reference. arrays are always passed by reference.
    cell_t *addr;
 -  if (symbol_->type()->isReference() || (symbol_->type()->isArray() && debugger_->ctx()->GetRuntime()->UsesDirectArrays() && (symbol_->scope() == SourcePawn::Argument || symbol_->scope() == SourcePawn::Local))) {
 -    if (debugger_->ctx()->LocalToPhysAddr(base, &addr) != SP_ERROR_NONE)
-+  if (symbol->type()->isReference() || (symbol->type()->isArray() && debugger->ctx()->GetRuntime()->UsesDirectArrays() && (symbol->scope() == SourcePawn::Argument || symbol->scope() == SourcePawn::Local))) {
-+    if (debugger->ctx()->LocalToPhysAddr(base, &addr) != SP_ERROR_NONE)
++  if (symbol->type()->isReference() || (symbol->type()->isArray() && ctx->GetRuntime()->UsesDirectArrays() && (symbol->scope() == SourcePawn::Argument || symbol->scope() == SourcePawn::Local))) {
++    if (SpLocalToPhys(ctx, base, sizeof(cell_t), &addr) != SP_ERROR_NONE)
        return false;
  
      assert(addr != nullptr);
-@@ -424,6 +438,12 @@ SymbolWrapper::GetEffectiveSymbolAddress(cell_t *address)
+@@ -424,6 +524,12 @@ SymbolWrapper::GetEffectiveSymbolAddress(cell_t *address)
    return true;
  }
  
@@ -1456,10 +1931,16 @@ index 1af30d8..3828151 100644
  {
    return renderType(symbol_->type(), symbol_->name() ? symbol_->name() : "");
 diff --git a/symbols.h b/symbols.h
-index 8a0703e..225175e 100644
+index 8a0703e..b857730 100644
 --- a/symbols.h
 +++ b/symbols.h
-@@ -35,26 +35,54 @@
+@@ -32,29 +32,66 @@
+ #define _INCLUDE_DEBUGGER_SYMBOL_H
+ 
+ #include <sp_vm_api.h>
++// IDebugSymbol & co. and SpPluginDebugInfo: the extension-side debug-info API
++// (stockvm/), so these build against the stock, unpatched SourcePawn headers.
++#include "plugin-debug-info.h"
  #include "amtl/am-hashmap.h"
  #include <memory>
  #include <string>
@@ -1482,6 +1963,12 @@ index 8a0703e..225175e 100644
 +// Returns false when the symbol has no readable address in the current frame.
 +bool ResolveSymbolAddress(Debugger* debugger, const SourcePawn::IDebugSymbol* symbol,
 +                          cell_t* address);
++
++// Same, against an explicit context and frame instead of the debugger's selected
++// ones. Breakpoint conditions are evaluated at the instant of the break, before
++// any frame has been selected, so they must not depend on that (stale) state.
++bool ResolveSymbolAddress(SourcePawn::IPluginContext* ctx, cell_t frm,
++                          const SourcePawn::IDebugSymbol* symbol, cell_t* address);
 +
 +} // namespace sp
 +
@@ -1517,7 +2004,7 @@ index 8a0703e..225175e 100644
  private:
    Debugger* debugger_;
    const SourcePawn::IDebugSymbol* symbol_;
-@@ -72,6 +100,7 @@ public:
+@@ -72,6 +109,7 @@ public:
    bool ClearWatch(uint32_t num);
    void ClearAllWatches();
    void ListWatches();
